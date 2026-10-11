@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Second Brain encrypted backup
+
+[Timer]
+OnCalendar=*-*-* 02:15:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=secondbrain-backup.service
+
+[Install]
+WantedBy=timers.target

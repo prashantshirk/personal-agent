@@ -1,0 +1,26 @@
+[Unit]
+Description=Create encrypted Second Brain database backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=secondbrain
+Group=secondbrain
+EnvironmentFile=/etc/secondbrain/env
+ExecStart=/opt/secondbrain/secondbrain --backup
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/secondbrain/data /var/lib/secondbrain/tmp
+MemoryMax=350M
+LimitNOFILE=4096

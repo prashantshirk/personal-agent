@@ -1,0 +1,71 @@
+name: Build and deploy Second Brain
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: secondbrain-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build Linux amd64 binary
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/secondbrain ./cmd/secondbrain
+
+      - name: Connect the runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          ping: ${{ secrets.VM_TAILSCALE_IP }}
+
+      - name: Prepare SSH credentials
+        env:
+          DEPLOY_KEY: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+          PINNED_HOST_KEY: ${{ secrets.VM_SSH_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/secondbrain_deploy"
+          chmod 600 "$HOME/.ssh/secondbrain_deploy"
+          printf '%s\n' "$PINNED_HOST_KEY" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Upload binary through Tailscale
+        env:
+          VM_TAILSCALE_IP: ${{ secrets.VM_TAILSCALE_IP }}
+        run: |
+          scp -i "$HOME/.ssh/secondbrain_deploy" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            dist/secondbrain "azureuser@${VM_TAILSCALE_IP}:/home/azureuser/secondbrain.new"
+
+      - name: Install and restart with rollback protection
+        env:
+          VM_TAILSCALE_IP: ${{ secrets.VM_TAILSCALE_IP }}
+        run: |
+          ssh -i "$HOME/.ssh/secondbrain_deploy" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            "azureuser@${VM_TAILSCALE_IP}" \
+            'sudo -n /usr/local/sbin/secondbrain-deploy'

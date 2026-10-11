@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+if [[ $# -ne 0 ]]; then
+  echo "This deployment command takes no arguments." >&2
+  exit 2
+fi
+
+incoming=/home/azureuser/secondbrain.new
+target=/opt/secondbrain/secondbrain
+staged=/opt/secondbrain/secondbrain.new
+previous=/opt/secondbrain/secondbrain.previous
+
+if [[ ! -f "$incoming" || -L "$incoming" ]]; then
+  echo "Missing or invalid deployment binary: $incoming" >&2
+  exit 1
+fi
+
+install -o root -g root -m 0755 "$incoming" "$staged"
+had_previous=0
+if [[ -x "$target" ]]; then
+  install -o root -g root -m 0755 "$target" "$previous"
+  had_previous=1
+fi
+mv -f "$staged" "$target"
+
+if systemctl restart secondbrain; then
+  sleep 2
+  if systemctl is-active --quiet secondbrain; then
+    rm -f "$incoming"
+    echo "Second Brain deployed and active. Previous binary: $previous"
+    exit 0
+  fi
+fi
+
+echo "New binary did not become active; restoring the previous binary." >&2
+if [[ $had_previous -eq 1 ]]; then
+  install -o root -g root -m 0755 "$previous" "$staged"
+  mv -f "$staged" "$target"
+else
+  rm -f "$target"
+fi
+systemctl restart secondbrain || true
+exit 1

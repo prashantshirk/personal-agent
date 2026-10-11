@@ -1,0 +1,40 @@
+[Unit]
+Description=Second Brain Telegram assistant
+After=network-online.target
+Wants=network-online.target
+Requires=telegram-bot-api.service
+After=telegram-bot-api.service
+
+[Service]
+Type=simple
+User=secondbrain
+Group=secondbrain
+EnvironmentFile=/etc/secondbrain/env
+ExecStart=/opt/secondbrain/secondbrain
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/secondbrain/data /var/lib/secondbrain/tmp /var/lib/telegram-bot-api
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+ProtectProc=invisible
+ProcSubset=pid
+MemoryHigh=350M
+MemoryMax=600M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
