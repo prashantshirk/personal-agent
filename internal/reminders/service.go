@@ -50,7 +50,7 @@ func(s *Service)fireDue(ctx context.Context){
 	type dueReminder struct{id int64;body,due string;critical,attempts int};var due []dueReminder;for rows.Next(){var r dueReminder;if err:=rows.Scan(&r.id,&r.body,&r.due,&r.critical,&r.attempts);err!=nil{s.log.Error("scan reminder failed","error",err);break};due=append(due,r)};rows.Close()
 	for _,r:=range due{parsed,_:=time.Parse(time.RFC3339Nano,r.due);late:=now.Sub(parsed)>time.Minute;label:="Reminder";if late{label="Reminder (late)"};message:=fmt.Sprintf("%s: %s",label,r.body)
 		keyboard:=telegram.InlineKeyboardMarkup{InlineKeyboard:[][]telegram.InlineKeyboardButton{{{Text:"Done",CallbackData:fmt.Sprintf("reminder:done:%d",r.id)},{Text:"Snooze 10 min",CallbackData:fmt.Sprintf("reminder:snooze10:%d",r.id)},{Text:"Snooze 1 h",CallbackData:fmt.Sprintf("reminder:snooze60:%d",r.id)}}}}
-		if r.critical!=0&&s.notifier!=nil{if err:=s.notifier.Publish(ctx,"Critical reminder",r.body,"urgent");err!=nil{s.log.Error("ntfy alert failed","reminder_id",r.id,"error",err)}}
+		if s.notifier!=nil{title:="Reminder";priority:="default";if r.critical!=0{title="Critical reminder";priority="urgent"};if err:=s.notifier.Publish(ctx,title,r.body,priority);err!=nil{s.log.Error("ntfy alert failed","reminder_id",r.id,"error",err)}}
 		if err:=s.api.SendMessageWithKeyboard(ctx,s.chatID(ctx),message,keyboard);err!=nil{s.log.Error("send reminder failed","reminder_id",r.id,"error",err);continue}
 		if r.critical!=0{_,err=s.db.ExecContext(ctx,`UPDATE reminders SET status='fired',attempts=attempts+1,next_attempt_at=? WHERE id=?`,now.Add(5*time.Minute).Format(time.RFC3339Nano),r.id)}else{_,err=s.db.ExecContext(ctx,`UPDATE reminders SET status='fired' WHERE id=?`,r.id)};if err!=nil{s.log.Error("update fired reminder failed","reminder_id",r.id,"error",err)}
 	}
@@ -66,6 +66,39 @@ func(s *Service)scheduleNext(ctx context.Context,id int64)error{
 }
 func boolInt(v bool)int{if v{return 1};return 0}
 func parseID(s string)(int64,error){return strconv.ParseInt(strings.TrimSpace(s),10,64)}
+
+// NextOccurrence computes the next fire time after prev for a recurrence rule.
+func NextOccurrence(prev time.Time, rule string, loc *time.Location) (time.Time, error) {
+	local := prev.In(loc)
+	switch rule {
+	case "daily":
+		return local.AddDate(0, 0, 1), nil
+	case "weekly":
+		return local.AddDate(0, 0, 7), nil
+	case "monthly":
+		return addMonthClamped(local), nil
+	default:
+		p := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+		schedule, err := p.Parse(rule)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return schedule.Next(local), nil
+	}
+}
+
+// ValidateRepeat checks a recurrence rule (empty, daily/weekly/monthly, or a five-field cron).
+func ValidateRepeat(rule string) error {
+	switch rule {
+	case "", "daily", "weekly", "monthly":
+		return nil
+	}
+	p := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	if _, err := p.Parse(rule); err != nil {
+		return fmt.Errorf("invalid recurrence rule: %w", err)
+	}
+	return nil
+}
 
 func addMonthClamped(t time.Time)time.Time{
 	y,m,_:=t.Date();target:=m+1;if target>time.December{y++;target=time.January};last:=time.Date(y,target+1,0,0,0,0,0,t.Location()).Day();day:=t.Day();if day>last{day=last};return time.Date(y,target,day,t.Hour(),t.Minute(),t.Second(),t.Nanosecond(),t.Location())

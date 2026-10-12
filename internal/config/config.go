@@ -24,6 +24,7 @@ type Config struct {
 	AgeRecipient, AgeIdentityFile, FirecrawlAPIKey                      string
 	FirecrawlDailyLimit                                                 int
 	NtfyURL, NtfyTopic, NtfyToken                                       string
+	MSGraphTokenFile                                                    string
 	OCRLangs                                                            string
 	OCRDPI, OCRMinTextChars                                             int
 	OCRImagePages                                                       bool
@@ -43,6 +44,7 @@ func Load() (Config, error) {
 		R2Bucket: os.Getenv("R2_BUCKET"), R2Endpoint: os.Getenv("R2_ENDPOINT"), AgeRecipient: os.Getenv("AGE_RECIPIENT"), AgeIdentityFile: value("AGE_IDENTITY_FILE", "/etc/secondbrain/age.key"),
 		StorageBackend: value("FILE_STORAGE_BACKEND", "none"), LocalStorageDir: os.Getenv("LOCAL_STORAGE_DIR"),
 		FirecrawlAPIKey: os.Getenv("FIRECRAWL_API_KEY"), FirecrawlDailyLimit: intValue("FIRECRAWL_DAILY_LIMIT", 25), NtfyURL: os.Getenv("NTFY_URL"), NtfyTopic: value("NTFY_TOPIC", "secondbrain-alerts"), NtfyToken: os.Getenv("NTFY_TOKEN"),
+		MSGraphTokenFile: value("MSGRAPH_TOKEN_FILE", "/etc/secondbrain/msgraph.json"),
 		OCRLangs: value("OCR_LANGS", "eng"), OCRDPI: intValue("OCR_DPI", 300), OCRMinTextChars: intValue("OCR_MIN_TEXT_CHARS", 30), OCRImagePages: boolValue("OCR_IMAGE_PAGES", true),
 		Timezone: value("TZ", "Asia/Kolkata"), DataDir: value("DATA_DIR", "./data"), TempDir: value("TMP_DIR", "./tmp"), GoMemLimit: value("GOMEMLIMIT", "200MiB"), HTTPTimeout: 30 * time.Second,
 	}

@@ -31,9 +31,9 @@ func Open(ctx context.Context, dir string) (*DB, error) {
 func (d *DB) Migrate(ctx context.Context) error {
 	var version int
 	if err := d.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil { return err }
-	for version < 8 {
+	for version < 10 {
 		next:=version+1
-		filename:=fmt.Sprintf("migrations/%03d_initial.sql",next);if next==2{filename="migrations/002_actions.sql"};if next==3{filename="migrations/003_transcripts.sql"};if next==4{filename="migrations/004_undo_origin.sql"};if next==5{filename="migrations/005_transcript_origin.sql"};if next==6{filename="migrations/006_action_origin.sql"};if next==7{filename="migrations/007_index_progress.sql"};if next==8{filename="migrations/008_firecrawl_backups.sql"}
+		filename:=fmt.Sprintf("migrations/%03d_initial.sql",next);if next==2{filename="migrations/002_actions.sql"};if next==3{filename="migrations/003_transcripts.sql"};if next==4{filename="migrations/004_undo_origin.sql"};if next==5{filename="migrations/005_transcript_origin.sql"};if next==6{filename="migrations/006_action_origin.sql"};if next==7{filename="migrations/007_index_progress.sql"};if next==8{filename="migrations/008_firecrawl_backups.sql"};if next==9{filename="migrations/009_chat_history.sql"};if next==10{filename="migrations/010_schedules.sql"}
 		sqlText,err:=migrations.ReadFile(filename);if err!=nil{return err}
 		tx,err:=d.BeginTx(ctx,nil);if err!=nil{return err}
 		if _,err=tx.ExecContext(ctx,string(sqlText));err!=nil{tx.Rollback();return fmt.Errorf("apply migration %d: %w",next,err)}

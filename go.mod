@@ -8,6 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.29.9
 	github.com/aws/aws-sdk-go-v2/credentials v1.17.62
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.78.2
+	github.com/go-pdf/fpdf v0.9.0
 	github.com/robfig/cron/v3 v3.0.1
 	golang.org/x/text v0.21.0
 	modernc.org/sqlite v1.34.5

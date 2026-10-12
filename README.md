@@ -1,6 +1,8 @@
 # Second Brain Bot
 
-A self-hosted single-user Telegram assistant built in Go. It stores notes, reminders and tasks; can keep encrypted files locally or in R2; indexes PDF/image text locally with SQLite FTS5; transcribes optional voice notes; and can use an OpenAI-compatible chat endpoint and Firecrawl web search.
+A self-hosted single-user Telegram assistant built in Go. It stores notes, reminders and tasks; schedules recurring research reports, messages, and stored-file sends; keeps encrypted files locally or in R2; indexes PDF/image text locally with SQLite FTS5; transcribes optional voice notes; and can use an OpenAI-compatible chat endpoint and Firecrawl web search.
+
+Create scheduled tasks in natural language (for example, “Every day at 7am, send me an AI news report” or “Send file #8 tomorrow at 7pm with a note to fill it out”). Use `/schedules` to list them, then ask the assistant to cancel a schedule by its ID. Reports use the configured LLM and Firecrawl daily limits.
 
 ## Project docs
 
@@ -18,4 +20,4 @@ The bot requires `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USER_ID`, Gemini settin
 
 For deployments, `.github/workflows/deploy.yml` builds the Linux amd64 executable and reaches the private VM through Tailscale. After the one-time setup in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), pushes to `main` deploy automatically; the VM retains its secrets and database.
 
-`go build ./...`, `go vet ./...`, and the Linux/amd64 cross-build passed. Tests passed for most packages, but Windows Application Control blocked the search and storage test executables; see `docs/ACCEPTANCE.md`. Live VM and integration checks remain before deployment acceptance.
+`go build ./...`, `go vet ./...`, and the Linux/amd64 cross-build passed. Focused tests passed for database, LLM, reminders, router, Firecrawl, storage, and ntfy; Windows Application Control blocked launching the search test executable. Stage 4 is deployed to the VM; end-to-end Telegram scheduling/report checks remain in `docs/ACCEPTANCE.md`.

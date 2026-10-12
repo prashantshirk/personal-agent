@@ -1,10 +1,13 @@
 package ocr
 
 import (
+	"archive/zip"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -135,6 +138,8 @@ func (w *Worker) indexFile(ctx context.Context, id int64) error {
 		err = w.indexPDF(ctx, id, name, caption, tags, localPath, progressID)
 	case strings.HasPrefix(mimeType, "image/"):
 		err = w.indexImage(ctx, id, name, caption, tags, localPath, progressID)
+	case mimeType == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || strings.EqualFold(filepath.Ext(name), ".docx"):
+		err = w.indexDocx(ctx, id, name, caption, tags, localPath, progressID)
 	default:
 		_, err = w.db.ExecContext(ctx, `UPDATE files SET index_status='skipped',pages=0,ocr_pages=0 WHERE id=?`, id)
 		if err == nil {
@@ -246,6 +251,129 @@ func (w *Worker) indexImage(ctx context.Context, id int64, name, caption, tags, 
 	return err
 }
 
+func (w *Worker) indexDocx(ctx context.Context, id int64, name, caption, tags, path string, progressID int64) error {
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return fmt.Errorf("open docx: %w", err)
+	}
+	defer zr.Close()
+	var textB strings.Builder
+	var media []*zip.File
+	for _, f := range zr.File {
+		switch {
+		case f.Name == "word/document.xml" || strings.HasPrefix(f.Name, "word/header") || strings.HasPrefix(f.Name, "word/footer"):
+			rc, e := f.Open()
+			if e != nil {
+				return e
+			}
+			e = decodeDocxPart(rc, &textB)
+			_ = rc.Close()
+			if e != nil {
+				return e
+			}
+		case strings.HasPrefix(f.Name, "word/media/"):
+			switch strings.ToLower(filepath.Ext(f.Name)) {
+			case ".png", ".jpg", ".jpeg":
+				media = append(media, f)
+			}
+		}
+	}
+	page, ocrPages := 0, 0
+	if wordText := strings.TrimSpace(textB.String()); wordText != "" || strings.TrimSpace(caption) != "" {
+		page++
+		if e := w.storePage(ctx, id, page, name, tags, "text", strings.TrimSpace(caption+"\n"+wordText)); e != nil {
+			return e
+		}
+	}
+	for i, f := range media {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		txt, e := w.ocrZipImage(ctx, f, id, i)
+		if e != nil {
+			w.log.Warn("docx image OCR failed", "file_id", id, "entry", f.Name, "error", e)
+			continue
+		}
+		if strings.TrimSpace(txt) == "" {
+			continue
+		}
+		page++
+		ocrPages++
+		if e := w.storePage(ctx, id, page, name, tags, "ocr", strings.TrimSpace(txt)); e != nil {
+			return e
+		}
+		if page%3 == 0 {
+			w.progress(progressID, fmt.Sprintf("Indexing %s: %d sections", name, page))
+		}
+	}
+	if page == 0 {
+		page = 1
+		if e := w.storePage(ctx, id, 1, name, tags, "text", strings.TrimSpace(caption)); e != nil {
+			return e
+		}
+	}
+	_, err = w.db.ExecContext(ctx, `UPDATE files SET index_status='done',pages=?,ocr_pages=? WHERE id=?`, page, ocrPages, id)
+	if err == nil {
+		w.progress(progressID, fmt.Sprintf("Indexed %s: %d sections, %d OCR'd.", name, page, ocrPages))
+	}
+	return err
+}
+
+// ocrZipImage extracts one embedded image from the docx archive and OCRs it, one at a time to keep memory bounded.
+func (w *Worker) ocrZipImage(ctx context.Context, f *zip.File, id int64, idx int) (string, error) {
+	rc, err := f.Open()
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	tmp := filepath.Join(w.cfg.TempDir, fmt.Sprintf("sb-docx-%d-%d%s", id, idx, strings.ToLower(filepath.Ext(f.Name))))
+	out, err := os.Create(tmp)
+	if err != nil {
+		return "", err
+	}
+	_, copyErr := io.Copy(out, io.LimitReader(rc, 50<<20))
+	closeErr := out.Close()
+	defer os.Remove(tmp)
+	if copyErr != nil {
+		return "", copyErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	return w.runTesseract(ctx, tmp)
+}
+
+func decodeDocxPart(r io.Reader, b *strings.Builder) error {
+	dec := xml.NewDecoder(r)
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "t":
+				var s string
+				if err := dec.DecodeElement(&s, &t); err != nil {
+					return err
+				}
+				b.WriteString(s)
+			case "tab":
+				b.WriteByte('\t')
+			}
+		case xml.EndElement:
+			switch t.Name.Local {
+			case "p", "br", "cr":
+				b.WriteByte('\n')
+			}
+		}
+	}
+}
+
 func (w *Worker) storePage(ctx context.Context, id int64, page int, title, tags, source, body string) error {
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -274,7 +402,7 @@ func (w *Worker) ocrPDFPage(ctx context.Context, pdf string, page int, id int64)
 func (w *Worker) runTesseract(ctx context.Context, path string) (string, error) {
 	cmdCtx, cancel := context.WithTimeout(ctx, commandTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(cmdCtx, "tesseract", path, "stdout", "-l", w.cfg.OCRLangs)
+	cmd := exec.CommandContext(cmdCtx, "tesseract", path, "stdout", "--oem", "1", "-l", w.cfg.OCRLangs, "-c", "preserve_interword_spaces=1")
 	cmd.Env = append(os.Environ(), "OMP_THREAD_LIMIT=1")
 	out, err := cmd.Output()
 	if err != nil {

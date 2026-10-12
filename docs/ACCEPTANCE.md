@@ -27,7 +27,10 @@ The acceptance checklist is designed for the real VM and Telegram account. It ca
 | 21 | Exceed daily LLM budget | Message saved as note with notice | Not run: configured LLM and live bot required | |
 | 22 | Backup and scratch restore | Restored DB integrity/search pass | Not run: live R2 credentials and scratch database required | |
 | 23 | Peak RAM on large scan | Within configured memory limits, no OOM | Not run: target VM and sample scan required | |
+| 24 | Create one-off scheduled message in natural language | It appears in `/schedules` and arrives at the requested time | Not run: user-visible Telegram check required | |
+| 25 | Create recurring scheduled report | Report arrives with source URLs; LLM/Firecrawl counters remain within configured limits | Not run: live LLM, Firecrawl, and Telegram check required | |
+| 26 | Schedule stored file and cancel a schedule | File arrives with note; cancellation prevents delivery | Not run: live Telegram check required | |
 
 ## Build verification status
 
-`go build ./...`, `go vet ./...`, and a Linux/amd64 cross-build passed. Tests passed for `db`, `firecrawl`, `llm`, `ntfy`, `reminders`, and `router`; Windows Application Control blocked launching the `search.test.exe` and `storage.test.exe` binaries. The restore flow and backup retention still need a live R2 bucket for end-to-end verification. Do not treat the acceptance rows as passed until recorded with measurements.
+`go build ./...`, `go vet ./...`, and the Linux/amd64 cross-build passed. Focused tests passed for `db`, `firecrawl`, `llm`, `ntfy`, `reminders`, `router`, and `storage`; Windows Application Control blocked launching `search.test.exe`. Stage 4 is deployed and migration 10 is applied. Scheduled delivery, report budget behavior, and file scheduling still need user-visible Telegram checks. The restore flow and backup retention still need end-to-end verification. Do not treat the acceptance rows as passed until recorded with measurements.

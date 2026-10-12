@@ -63,6 +63,23 @@ func (c *Client) SendMessageID(ctx context.Context, chatID int64, text string)(i
 func (c *Client) EditMessageText(ctx context.Context,chatID,messageID int64,text string)error{return c.call(ctx,"editMessageText",map[string]any{"chat_id":chatID,"message_id":messageID,"text":text},nil)}
 func (c *Client) SendMessageWithKeyboard(ctx context.Context, chatID int64, text string, keyboard InlineKeyboardMarkup) error { return c.call(ctx,"sendMessage",map[string]any{"chat_id":chatID,"text":text,"reply_markup":keyboard},nil) }
 func (c *Client) AnswerCallback(ctx context.Context, id, text string) error { return c.call(ctx,"answerCallbackQuery",map[string]any{"callback_query_id":id,"text":text},nil) }
+func (c *Client) DeleteMessage(ctx context.Context, chatID, messageID int64) error { return c.call(ctx,"deleteMessage",map[string]any{"chat_id":chatID,"message_id":messageID},nil) }
+func (c *Client) EditMessageKeyboard(ctx context.Context, chatID, messageID int64, text string, keyboard InlineKeyboardMarkup) error { return c.call(ctx,"editMessageText",map[string]any{"chat_id":chatID,"message_id":messageID,"text":text,"reply_markup":keyboard},nil) }
+func (c *Client) SendPhotoWithKeyboard(ctx context.Context, chatID int64, path, caption string, keyboard InlineKeyboardMarkup) error {
+	pr,pw:=io.Pipe();mw:=multipart.NewWriter(pw);done:=make(chan error,1)
+	go func(){
+		defer close(done);defer pw.Close()
+		if err:=mw.WriteField("chat_id",strconv.FormatInt(chatID,10));err!=nil{_ = pw.CloseWithError(err);done<-err;return}
+		if caption!=""{if err:=mw.WriteField("caption",caption);err!=nil{_ = pw.CloseWithError(err);done<-err;return}}
+		kb,_:=json.Marshal(keyboard);if err:=mw.WriteField("reply_markup",string(kb));err!=nil{_ = pw.CloseWithError(err);done<-err;return}
+		file,err:=os.Open(path);if err!=nil{_ = pw.CloseWithError(err);done<-err;return};defer file.Close()
+		part,err:=mw.CreateFormFile("photo",filepath.Base(path));if err==nil{_,err=io.Copy(part,file)};if err==nil{err=mw.Close()};if err!=nil{_ = pw.CloseWithError(err)};done<-err
+	}()
+	req,err:=http.NewRequestWithContext(ctx,http.MethodPost,c.base+"/bot"+c.token+"/sendPhoto",pr);if err!=nil{_ = pr.CloseWithError(err);return err}
+	req.Header.Set("Content-Type",mw.FormDataContentType());client:=*c.http;client.Timeout=5*time.Minute
+	resp,err:=client.Do(req);if err!=nil{_ = pr.CloseWithError(err);return err};defer resp.Body.Close();writerErr:=<-done;if writerErr!=nil{return writerErr}
+	data,err:=io.ReadAll(io.LimitReader(resp.Body,1<<20));if err!=nil{return err};var answer struct{OK bool `json:"ok"`;Description string `json:"description"`};if err=json.Unmarshal(data,&answer);err!=nil{return fmt.Errorf("Telegram photo send returned invalid JSON")};if !answer.OK{return fmt.Errorf("Telegram photo send failed: %s",answer.Description)};return nil
+}
 func (c *Client) SendFile(ctx context.Context,chatID int64,path,name,mimeType string)error{
 	method,field:="sendDocument","document";if strings.HasPrefix(mimeType,"image/"){method,field="sendPhoto","photo"}else if strings.HasPrefix(mimeType,"video/"){method,field="sendVideo","video"}
 	pr,pw:=io.Pipe();mw:=multipart.NewWriter(pw);done:=make(chan error,1)

@@ -18,6 +18,7 @@ import (
 	"secondbrain/internal/ocr"
 	"secondbrain/internal/reminders"
 	"secondbrain/internal/router"
+	"secondbrain/internal/scheduler"
 	"secondbrain/internal/storage"
 	"secondbrain/internal/telegram"
 )
@@ -99,6 +100,8 @@ func main() {
 		go monitor.Run(ctx, cfg.DataDir, database, notifier, logger)
 	}
 	brain := llm.NewBrain(cfg, database, api, reminderService, fileService)
+	scheduleService := scheduler.New(database, api, brain, fileService, reminderService.Location(), cfg.TempDir, logger)
+	go scheduleService.Run(ctx)
 	handler := router.New(cfg, database, api, reminderService, brain, fileService, backupService, logger)
 	var offset int64
 	for ctx.Err() == nil {

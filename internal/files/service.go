@@ -1,6 +1,7 @@
 package files
 
 import (
+	"archive/zip"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -131,6 +133,52 @@ func (s *Service) Recent(ctx context.Context) (string, error) {
 	}
 	return b.String(), nil
 }
+type FileRow struct {
+	ID, Size int64
+	Name, Status, Mime string
+}
+
+// Category buckets a file for the /files browser.
+func Category(mime, name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		return "photo"
+	case strings.HasPrefix(mime, "video/"):
+		return "video"
+	case mime == "application/pdf" || ext == ".pdf" || ext == ".docx" || ext == ".doc" || ext == ".txt" || ext == ".md" || strings.Contains(mime, "word") || strings.Contains(mime, "document"):
+		return "document"
+	case ext == ".go" || ext == ".py" || ext == ".js" || ext == ".ts" || ext == ".java" || ext == ".c" || ext == ".cpp" || ext == ".rs" || ext == ".sh" || ext == ".json" || ext == ".html" || ext == ".css" || ext == ".yml" || ext == ".yaml":
+		return "code"
+	default:
+		return "other"
+	}
+}
+
+// List returns recent files in a category (photo, document, video, code, other).
+func (s *Service) List(ctx context.Context, category string, limit int) ([]FileRow, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,COALESCE(mime,''),size,index_status FROM files ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileRow
+	for rows.Next() {
+		var r FileRow
+		if err := rows.Scan(&r.ID, &r.Name, &r.Mime, &r.Size, &r.Status); err != nil {
+			return nil, err
+		}
+		if Category(r.Mime, r.Name) != category {
+			continue
+		}
+		out = append(out, r)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, rows.Err()
+}
+
 func (s *Service) Tag(ctx context.Context, id int64, tags string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -202,6 +250,88 @@ func (s *Service) SendToChat(ctx context.Context, id, chatID int64, tempDir stri
 	}
 	return api.SendFile(ctx, chatID, path, name, mimeType)
 }
+// PreviewImage produces a small preview image for a file (first PDF page, the photo itself,
+// or the first embedded docx image). Returns the image path and a cleanup func the caller must run.
+func (s *Service) PreviewImage(ctx context.Context, id int64, tempDir string) (string, func(), error) {
+	var key, name, mimeType string
+	if err := s.db.QueryRowContext(ctx, `SELECT r2_key,name,COALESCE(mime,'') FROM files WHERE id=?`, id).Scan(&key, &name, &mimeType); err != nil {
+		return "", nil, err
+	}
+	if err := os.MkdirAll(tempDir, 0700); err != nil {
+		return "", nil, err
+	}
+	raw, err := os.CreateTemp(tempDir, "prev-raw-*")
+	if err != nil {
+		return "", nil, err
+	}
+	rawPath := raw.Name()
+	_ = raw.Close()
+	_ = os.Remove(rawPath)
+	if err := s.storage.DownloadDecrypted(ctx, key, rawPath); err != nil {
+		return "", nil, err
+	}
+	cleanupRaw := func() { _ = os.Remove(rawPath) }
+	ext := strings.ToLower(filepath.Ext(name))
+	switch {
+	case strings.HasPrefix(mimeType, "image/") || Category(mimeType, name) == "photo":
+		return rawPath, cleanupRaw, nil
+	case mimeType == "application/pdf" || ext == ".pdf":
+		defer cleanupRaw()
+		prefix := filepath.Join(tempDir, fmt.Sprintf("prev-%d", id))
+		out := prefix + ".png"
+		cmd := exec.CommandContext(ctx, "pdftoppm", "-f", "1", "-l", "1", "-singlefile", "-r", "150", "-png", "-gray", rawPath, prefix)
+		if combined, err := cmd.CombinedOutput(); err != nil {
+			return "", nil, fmt.Errorf("pdftoppm: %w (%s)", err, strings.TrimSpace(string(combined)))
+		}
+		return out, func() { _ = os.Remove(out) }, nil
+	case ext == ".docx" || strings.Contains(mimeType, "word") || strings.Contains(mimeType, "document"):
+		defer cleanupRaw()
+		img, err := extractFirstDocxImage(rawPath, tempDir, id)
+		if err != nil {
+			return "", nil, err
+		}
+		return img, func() { _ = os.Remove(img) }, nil
+	}
+	cleanupRaw()
+	return "", nil, fmt.Errorf("no preview available for this file type")
+}
+
+func extractFirstDocxImage(path, tempDir string, id int64) (string, error) {
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return "", err
+	}
+	defer zr.Close()
+	for _, f := range zr.File {
+		if !strings.HasPrefix(f.Name, "word/media/") {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(f.Name))
+		if ext != ".png" && ext != ".jpg" && ext != ".jpeg" {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return "", err
+		}
+		out := filepath.Join(tempDir, fmt.Sprintf("prev-docx-%d%s", id, ext))
+		w, err := os.Create(out)
+		if err != nil {
+			_ = rc.Close()
+			return "", err
+		}
+		_, copyErr := io.Copy(w, io.LimitReader(rc, 50<<20))
+		_ = w.Close()
+		_ = rc.Close()
+		if copyErr != nil {
+			_ = os.Remove(out)
+			return "", copyErr
+		}
+		return out, nil
+	}
+	return "", fmt.Errorf("document has no embedded image to preview")
+}
+
 func (s *Service) RequestDelete(ctx context.Context, id int64) (int64, error) {
 	var name string
 	if err := s.db.QueryRowContext(ctx, `SELECT name FROM files WHERE id=?`, id).Scan(&name); err != nil {

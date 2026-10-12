@@ -61,7 +61,7 @@ func quote(s string)string{return `"`+strings.ReplaceAll(s,`"`,`""`)+`"`}
 
 func runQuery(ctx context.Context,db *sql.DB,table,match string,f Filter,limit,offset int)([]Result,error){
 	if table!="search_fts"&&table!="search_tri"{return nil,fmt.Errorf("invalid index")}
-	query:=`SELECT kind,CAST(ref_id AS INTEGER),COALESCE(CAST(page AS INTEGER),0),title,snippet(`+table+`,2,'[',']',' … ',12),
+	query:=`SELECT kind,CAST(ref_id AS INTEGER),COALESCE(CAST(page AS INTEGER),0),title,snippet(`+table+`,2,'','',' … ',12),
 COALESCE((SELECT created_at FROM notes n WHERE n.id=CAST(`+table+`.ref_id AS INTEGER) AND `+table+`.kind='note'),(SELECT created_at FROM files f WHERE f.id=CAST(`+table+`.ref_id AS INTEGER) AND `+table+`.kind='file'),'')
 FROM `+table+` WHERE `+table+` MATCH ?
 AND (?='' OR kind=?) AND (?='' OR lower(tags) LIKE '%'||lower(?)||'%')
