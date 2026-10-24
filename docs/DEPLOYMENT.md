@@ -1,6 +1,6 @@
 # Deployment and VM preparation
 
-These commands are for the Ubuntu VM described in `DESIGN.md` (2 vCPU, 1 GB RAM). They were not run from this workspace. Review the provider's firewall and SSH access before enabling UFW.
+These commands describe initial setup. For day-to-day VM access, data locations, deploys, stopping, and removal, see the [VM operations guide](VM.md). The current Azure VM is reached over Tailscale SSH and has no public IP.
 
 ## One-time VM preparation
 
@@ -46,7 +46,7 @@ These commands are for the Ubuntu VM described in `DESIGN.md` (2 vCPU, 1 GB RAM)
    GOOS=linux GOARCH=amd64 go build -trimpath -o secondbrain ./cmd/secondbrain
    ```
 
-   Use `GOARCH=arm64` for an aarch64 VM. Copy the binary to `/opt/secondbrain/secondbrain` and set it executable and owned by `secondbrain`. Avoid compiling the C++ Bot API server on a 1 GB VM; the official project build requires a C++ toolchain and can be memory intensive.
+   Use `GOARCH=arm64` for an aarch64 VM. Copy the binary to `/opt/secondbrain/secondbrain`, owned by root and executable by the service user. Avoid compiling the C++ Bot API server on a 1 GB VM; the official project build requires a C++ toolchain and can be memory intensive.
 
 ## Configure the bot and provider failover
 
@@ -73,7 +73,8 @@ The workflow at `.github/workflows/deploy.yml` builds the Linux amd64 executable
 From Windows PowerShell in the project directory, upload the root-owned deploy helper:
 
 ```powershell
-scp .\deploy\secondbrain-deploy ziglin:/tmp/secondbrain-deploy
+$Vm = "your-vm-ssh-alias"
+scp .\deploy\secondbrain-deploy "${Vm}:/tmp/secondbrain-deploy"
 ```
 
 On the VM, install it and permit `azureuser` to run only this fixed deploy command without a sudo password:
@@ -99,7 +100,7 @@ ssh-keygen -t ed25519 -C "secondbrain-github-actions" -f "$env:USERPROFILE\.ssh\
 Append the **public** key to the VM account's authorized keys:
 
 ```powershell
-Get-Content "$env:USERPROFILE\.ssh\secondbrain_github_actions.pub" | ssh ziglin "umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys"
+Get-Content "$env:USERPROFILE\.ssh\secondbrain_github_actions.pub" | ssh $Vm "umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys"
 ```
 
 Never add the private key to the VM or repository. Add it as a GitHub repository secret in the next section.
@@ -125,18 +126,18 @@ In the GitHub repository, open **Settings → Secrets and variables → Actions*
 Get the host key line on the VM with:
 
 ```bash
-sudo awk '{print "100.125.171.85 " $0}' /etc/ssh/ssh_host_ed25519_key.pub
+sudo awk '{print "<VM-TAILSCALE-IP> " $0}' /etc/ssh/ssh_host_ed25519_key.pub
 ```
 
-Replace the sample IP with the current Tailscale IP. This is a public host key, used to verify the VM during deployment. Keep all API keys out of GitHub Actions; the workflow does not need them.
+Replace `<VM-TAILSCALE-IP>` with the current Tailscale IP. This is a public host key, used to verify the VM during deployment. Keep all API keys out of GitHub Actions; the workflow does not need them.
 
-After adding the workflow and VM helper to the GitHub repository, push to `main`. Future pushes build and deploy automatically. For a manual deployment now, build with `make linux`, then from PowerShell run `scp .\bin\secondbrain-linux ziglin:/home/azureuser/secondbrain.new` followed by `ssh ziglin "sudo -n /usr/local/sbin/secondbrain-deploy"`.
+After adding the workflow and VM helper to the GitHub repository, push to `main`. Future pushes build and deploy automatically. The workflow does not deploy other branches. For the detailed manual build, upload, rollback, stop, and uninstall steps, use the [VM operations guide](VM.md).
 
 ## Local Telegram Bot API server
 
 The local server is needed for large file downloads. The official server supports `--local`, accepts `--api-id`/`--api-hash` directly or through environment variables, and can return absolute paths for local files. It defaults to port 8081 and its default listen IP is all IPv4 interfaces, so explicitly restrict it to `127.0.0.1`. Keep the API ID/hash in a root-readable environment file, never on a command line or in chat.
 
-1. Obtain an API ID/hash through Telegram's `my.telegram.org` developer tools and put them in `/etc/secondbrain/telegram-api.env`:
+1. Obtain an API ID/hash through Telegram's `my.telegram.org` developer tools and put them in `/etc/secondbrain/telegram-bot-api.env`:
 
    ```ini
    TELEGRAM_API_ID=your_numeric_id
@@ -144,8 +145,8 @@ The local server is needed for large file downloads. The official server support
    ```
 
    ```bash
-   sudo chown root:secondbrain /etc/secondbrain/telegram-api.env
-   sudo chmod 640 /etc/secondbrain/telegram-api.env
+   sudo chown root:secondbrain /etc/secondbrain/telegram-bot-api.env
+   sudo chmod 640 /etc/secondbrain/telegram-bot-api.env
    sudo mkdir -p /var/lib/telegram-bot-api
    sudo chown secondbrain:secondbrain /var/lib/telegram-bot-api
    ```
@@ -164,7 +165,7 @@ The local server is needed for large file downloads. The official server support
    Type=simple
    User=secondbrain
    Group=secondbrain
-   EnvironmentFile=/etc/secondbrain/telegram-api.env
+   EnvironmentFile=/etc/secondbrain/telegram-bot-api.env
    WorkingDirectory=/var/lib/telegram-bot-api
    ExecStart=/usr/local/bin/telegram-bot-api --local --http-ip-address=127.0.0.1 --http-port=8081 --dir=/var/lib/telegram-bot-api
    Restart=on-failure

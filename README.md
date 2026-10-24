@@ -8,6 +8,7 @@ Create scheduled tasks in natural language (for example, “Every day at 7am, se
 
 - [Full design and source of truth](docs/DESIGN.md)
 - [Deployment and VM preparation](docs/DEPLOYMENT.md)
+- [VM operations: access, data, deploy, stop, remove](docs/VM.md)
 - [Restore runbook](docs/RUNBOOK.md)
 - [Operations and recovery](docs/OPERATIONS.md)
 - [Acceptance checklist and run status](docs/ACCEPTANCE.md)

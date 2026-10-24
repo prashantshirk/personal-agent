@@ -18,7 +18,7 @@ Back up `/etc/secondbrain/age.key` offline in a password manager or encrypted re
 
 The preferred release path is GitHub Actions: a push to `main` builds the Linux amd64 binary, connects to the private VM through an ephemeral Tailscale runner, and runs `/usr/local/sbin/secondbrain-deploy`. The helper retains the prior binary and rolls back if the service does not remain active. See `docs/DEPLOYMENT.md` for the one-time setup.
 
-For a manual release, build with `make linux`, copy `bin/secondbrain-linux` to `/home/azureuser/secondbrain.new` using `scp` over Tailscale, then run `ssh ziglin "sudo -n /usr/local/sbin/secondbrain-deploy"`. Verify `/status`, notes, search, reminders, and the journal after the release.
+For a manual release from Windows, follow the exact build, upload, backup, rollback, and verification steps in the [VM operations guide](VM.md). GitHub pushes to a non-`main` branch do not deploy the bot.
 
 Apply database schema changes through the built-in numbered migration runner. Take a backup before a release that changes the schema.
 
