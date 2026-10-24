@@ -25,6 +25,7 @@ type PhotoSize struct { FileID string `json:"file_id"`; Width int `json:"width"`
 type Video struct { FileID string `json:"file_id"`; FileName string `json:"file_name"`; MimeType string `json:"mime_type"`; FileSize int64 `json:"file_size"` }
 type CallbackQuery struct { ID string `json:"id"`; From User `json:"from"`; Message *Message `json:"message"`; Data string `json:"data"` }
 type InlineKeyboardButton struct { Text string `json:"text"`; CallbackData string `json:"callback_data,omitempty"` }
+type BotCommand struct { Command string `json:"command"`; Description string `json:"description"` }
 type InlineKeyboardMarkup struct { InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"` }
 type Update struct { UpdateID int64 `json:"update_id"`; Message *Message `json:"message"`; EditedMessage *Message `json:"edited_message"`; CallbackQuery *CallbackQuery `json:"callback_query"` }
 type apiResponse[T any] struct { OK bool `json:"ok"`; Description string `json:"description"`; Result T `json:"result"` }
@@ -59,6 +60,9 @@ func (c *Client) callLong(ctx context.Context, method string, params any, result
 	var envelope struct{OK bool `json:"ok"`;Description string `json:"description"`;Result json.RawMessage `json:"result"`};if err=json.Unmarshal(data,&envelope);err!=nil{return fmt.Errorf("telegram poll returned HTTP %d: invalid JSON",resp.StatusCode)};if !envelope.OK{return fmt.Errorf("telegram poll: %s",envelope.Description)};return json.Unmarshal(envelope.Result,result)
 }
 func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) error { return c.call(ctx,"sendMessage",map[string]any{"chat_id":chatID,"text":text},nil) }
+func (c *Client) SendChatAction(ctx context.Context, chatID int64, action string) error { return c.call(ctx,"sendChatAction",map[string]any{"chat_id":chatID,"action":action},nil) }
+func (c *Client) SetMyCommands(ctx context.Context, commands []BotCommand) error { return c.call(ctx,"setMyCommands",map[string]any{"commands":commands},nil) }
+func (c *Client) SendMessageWithKeyboardID(ctx context.Context, chatID int64, text string, keyboard InlineKeyboardMarkup) (int64, error) { var message struct{MessageID int64 `json:"message_id"`}; err := c.call(ctx,"sendMessage",map[string]any{"chat_id":chatID,"text":text,"reply_markup":keyboard},&message); return message.MessageID, err }
 func (c *Client) SendMessageID(ctx context.Context, chatID int64, text string)(int64,error){var message struct{MessageID int64 `json:"message_id"`};err:=c.call(ctx,"sendMessage",map[string]any{"chat_id":chatID,"text":text},&message);return message.MessageID,err}
 func (c *Client) EditMessageText(ctx context.Context,chatID,messageID int64,text string)error{return c.call(ctx,"editMessageText",map[string]any{"chat_id":chatID,"message_id":messageID,"text":text},nil)}
 func (c *Client) SendMessageWithKeyboard(ctx context.Context, chatID int64, text string, keyboard InlineKeyboardMarkup) error { return c.call(ctx,"sendMessage",map[string]any{"chat_id":chatID,"text":text,"reply_markup":keyboard},nil) }

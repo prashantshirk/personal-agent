@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"secondbrain/internal/backup"
@@ -35,10 +36,22 @@ type Router struct {
 	brain       *llm.Brain
 	fileService *files.Service
 	backups     *backup.Service
+	// searchMu/searches/searchSeq hold only the last page of in-memory
+	// search state (query + offset), keyed by a small sequence number in
+	// the callback. No file or note contents are stored here, the map is
+	// capped, and a restart simply makes old Next/Prev buttons expire.
+	searchMu  sync.Mutex
+	searches  map[int64]searchState
+	searchSeq int64
+}
+
+type searchState struct {
+	query  string
+	offset int
 }
 
 func New(cfg config.Config, database *db.DB, api *telegram.Client, reminderService *reminders.Service, brain *llm.Brain, fileService *files.Service, backupService *backup.Service, logger *slog.Logger) *Router {
-	return &Router{cfg: cfg, db: database, api: api, log: logger, reminders: reminderService, brain: brain, fileService: fileService, backups: backupService, startedAt: time.Now()}
+	return &Router{cfg: cfg, db: database, api: api, log: logger, reminders: reminderService, brain: brain, fileService: fileService, backups: backupService, startedAt: time.Now(), searches: make(map[int64]searchState)}
 }
 func AllowedUser(userID, allowed int64) bool { return userID != 0 && userID == allowed }
 
@@ -119,12 +132,170 @@ func (r *Router) Handle(ctx context.Context, u telegram.Update) {
 	}
 }
 
+const helpText = "🤖 Second Brain Bot\n──────────────\n\nTap /menu for quick actions, or use:\n/note <text> — save a note\n/find <query> — search your notes and files first (local only)\n/remind <when> | <text> — set a reminder; say urgent/critical/max priority for a repeating phone alarm\n/reminders — upcoming reminders\n/schedules — scheduled reports, messages and files\n/task <text> — add a task\n/tasks — open tasks\n/done <id> — mark a reminder or task done\n/cancel <id> — cancel a reminder\n/today — today's reminders and open tasks\n/files — browse saved files\n/status — RAM, disk, jobs and next reminder\n/usage — LLM tokens today\n/forget — clear recent chat memory\n\n🔍 Search rule: “find …” always searches your local index first. The web is used only when local finds nothing, or when you explicitly say “search the web”.\n🎙 Voice: tap Edit to correct a transcript, Undo to remove what it created — the message itself updates to confirm.\n📸 Photos: send images as a File (not a Photo) for the sharpest OCR."
+
+func menuKeyboard() telegram.InlineKeyboardMarkup {
+	return telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
+		{{Text: "📅 Today", CallbackData: "menu:today"}, {Text: "⏰ Reminders", CallbackData: "menu:reminders"}},
+		{{Text: "✅ Tasks", CallbackData: "menu:tasks"}, {Text: "📂 Files", CallbackData: "menu:files"}},
+		{{Text: "🗓 Schedules", CallbackData: "menu:schedules"}, {Text: "📊 Status", CallbackData: "menu:status"}},
+		{{Text: "❓ Help", CallbackData: "menu:help"}},
+	}}
+}
+
+func backToMenuKeyboard() telegram.InlineKeyboardMarkup {
+	return telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
+		{{Text: "⬅ Menu", CallbackData: "menu:home"}},
+	}}
+}
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n <= 1 {
+		return string(r[:n])
+	}
+	return string(r[:n-1]) + "…"
+}
+
+// splitMessage splits on newlines where possible, never breaking a rune,
+// so long Telegram answers are sent as several short messages instead of
+// one message that Telegram rejects for being over 4096 characters.
+func splitMessage(text string, max int) []string {
+	if max <= 0 {
+		max = 3900
+	}
+	var out []string
+	runes := []rune(text)
+	for len(runes) > 0 {
+		if len(runes) <= max {
+			out = append(out, string(runes))
+			break
+		}
+		cut := max
+		for i := max - 1; i > max/2; i-- {
+			if runes[i] == '\n' {
+				cut = i
+				break
+			}
+		}
+		out = append(out, string(runes[:cut]))
+		runes = runes[cut:]
+		for len(runes) > 0 && runes[0] == '\n' {
+			runes = runes[1:]
+		}
+	}
+	return out
+}
+
+func (r *Router) sendLong(ctx context.Context, chatID int64, text string) error {
+	for _, chunk := range splitMessage(text, 3900) {
+		if err := r.api.SendMessage(ctx, chatID, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sendLongWithFirst edits a placeholder message (for example "Thinking…")
+// into the first chunk, then sends any remaining chunks as new messages.
+// If there is no placeholder it behaves like sendLong.
+func (r *Router) sendLongWithFirst(ctx context.Context, chatID, firstID int64, text string) error {
+	chunks := splitMessage(text, 3900)
+	for i, chunk := range chunks {
+		if i == 0 && firstID > 0 {
+			if err := r.api.EditMessageText(ctx, chatID, firstID, chunk); err != nil {
+				return r.api.SendMessage(ctx, chatID, chunk)
+			}
+			continue
+		}
+		if err := r.api.SendMessage(ctx, chatID, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// todayAgenda is deliberately local and cheap: two small, bounded SQLite
+// queries, no LLM call, no file reads. Times are shown in the configured
+// timezone; due_at is stored in UTC.
+func (r *Router) todayAgenda(ctx context.Context) (string, error) {
+	loc := r.reminders.Location()
+	now := time.Now().In(loc)
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	dayEnd := dayStart.AddDate(0, 0, 1)
+	var b strings.Builder
+	fmt.Fprintf(&b, "📅 Today — %s\n", now.Format("Mon Jan 2"))
+	b.WriteString("\n⏰ Reminders due today:\n")
+	rows, err := r.db.QueryContext(ctx, `SELECT body, due_at, critical FROM reminders WHERE status IN ('scheduled','fired') AND due_at >= ? AND due_at < ? ORDER BY due_at LIMIT 20`, dayStart.UTC().Format(time.RFC3339Nano), dayEnd.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return "", err
+	}
+	count := 0
+	for rows.Next() {
+		var body, due string
+		var critical int
+		if err := rows.Scan(&body, &due, &critical); err != nil {
+			rows.Close()
+			return "", err
+		}
+		t, _ := time.Parse(time.RFC3339Nano, due)
+		fmt.Fprintf(&b, "• %s — %s", t.In(loc).Format("15:04"), body)
+		if critical != 0 {
+			b.WriteString(" [critical]")
+		}
+		b.WriteByte('\n')
+		count++
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if count == 0 {
+		b.WriteString("None.\n")
+	}
+	b.WriteString("\n✅ Open tasks:\n")
+	taskRows, err := r.db.QueryContext(ctx, `SELECT id, body FROM tasks WHERE status='open' ORDER BY id DESC LIMIT 10`)
+	if err != nil {
+		return "", err
+	}
+	taskCount := 0
+	for taskRows.Next() {
+		var id int64
+		var body string
+		if err := taskRows.Scan(&id, &body); err != nil {
+			taskRows.Close()
+			return "", err
+		}
+		fmt.Fprintf(&b, "• #%d %s\n", id, body)
+		taskCount++
+	}
+	taskRows.Close()
+	if err := taskRows.Err(); err != nil {
+		return "", err
+	}
+	if taskCount == 0 {
+		b.WriteString("None.\n")
+	}
+	return b.String(), nil
+}
+
 func (r *Router) handleTextFromInbox(ctx context.Context, m *telegram.Message, text string, originInboxID int64) error {
 	text = strings.TrimSpace(text)
 	lower := strings.ToLower(text)
 	switch {
 	case lower == "/start" || lower == "/help":
-		return r.api.SendMessage(ctx, m.Chat.ID, "Second Brain Bot is running. Commands: /note <text>, /find <query>, /remind <when> | <text>, /reminders, /schedules, /task <text>, /tasks, /done <id>, /cancel <id>, /status, /usage. You can ask me to schedule a report, message, or file in natural language.")
+		return r.api.SendMessageWithKeyboard(ctx, m.Chat.ID, helpText, menuKeyboard())
+	case lower == "/menu":
+		return r.api.SendMessageWithKeyboard(ctx, m.Chat.ID, "🏠 Second Brain menu", menuKeyboard())
+	case lower == "/today":
+		body, err := r.todayAgenda(ctx)
+		if err != nil {
+			return err
+		}
+		return r.api.SendMessageWithKeyboard(ctx, m.Chat.ID, body, backToMenuKeyboard())
 	case strings.HasPrefix(lower, "/status"):
 		return r.api.SendMessage(ctx, m.Chat.ID, r.status(ctx))
 	case lower == "/forget" || lower == "/clear":
@@ -140,7 +311,7 @@ func (r *Router) handleTextFromInbox(ctx context.Context, m *telegram.Message, t
 		if query == "" {
 			return r.api.SendMessage(ctx, m.Chat.ID, "Usage: /find <query>")
 		}
-		return r.replySearch(ctx, m.Chat.ID, query)
+		return r.handleSearchRequest(ctx, m.Chat.ID, query)
 	case lower == "/remind" || strings.HasPrefix(lower, "/remind "):
 		return r.createReminderFrom(ctx, m.Chat.ID, strings.TrimSpace(text[len("/remind"):]), originInboxID)
 	case lower == "/reminders":
@@ -243,10 +414,10 @@ func (r *Router) handleTextFromInbox(ctx context.Context, m *telegram.Message, t
 			return r.api.SendMessage(ctx, m.Chat.ID, "ntfy is not configured yet.")
 		}
 		client := ntfy.New(r.cfg.NtfyURL, r.cfg.NtfyTopic, r.cfg.NtfyToken)
-		if err := client.Publish(ctx, "Second Brain test alarm", "This is a test notification.", "urgent"); err != nil {
+		if err := client.Publish(ctx, "Second Brain test alarm", "This is a test notification.", "5"); err != nil {
 			return r.api.SendMessage(ctx, m.Chat.ID, "ntfy test failed. Check the ntfy URL and token.")
 		}
-		return r.api.SendMessage(ctx, m.Chat.ID, "Test alarm sent to ntfy.")
+		return r.api.SendMessage(ctx, m.Chat.ID, "🚨 Test alarm sent to ntfy at max priority (5). If it did not ring, allow ntfy to bypass Do Not Disturb/Focus on your phone, then try again.")
 	case strings.HasPrefix(lower, "/note "):
 		body := strings.TrimSpace(text[len("/note "):])
 		if body == "" {
@@ -258,7 +429,15 @@ func (r *Router) handleTextFromInbox(ctx context.Context, m *telegram.Message, t
 		return r.api.SendMessage(ctx, m.Chat.ID, "Saved note.")
 	default:
 		if isLocalSearch(text) && !r.cfg.LLMSearchIntent {
-			return r.replySearch(ctx, m.Chat.ID, searchRemainder(text))
+			return r.handleSearchRequest(ctx, m.Chat.ID, searchRemainder(text))
+		}
+		if isExplicitWeb(text) && !r.cfg.LLMSearchIntent {
+			// "search the web for X" still checks local first, per the
+			// local-first policy, then falls back to the web if empty.
+			query := explicitWebQuery(text)
+			if query != "" {
+				return r.handleSearchRequest(ctx, m.Chat.ID, query)
+			}
 		}
 		if r.brain == nil {
 			if _, err := notes.New(r.db).AddWithOrigin(ctx, text, noteSource(originInboxID), originInboxID); err != nil {
@@ -266,24 +445,39 @@ func (r *Router) handleTextFromInbox(ctx context.Context, m *telegram.Message, t
 			}
 			return r.api.SendMessage(ctx, m.Chat.ID, "Saved as a note. Configure the LLM to enable natural language actions.")
 		}
+		// Show work in progress instead of silence while the LLM round
+		// trips: a typing action plus a placeholder that is edited into
+		// the answer, so a slow provider does not look like a dead bot.
+		_ = r.api.SendChatAction(ctx, m.Chat.ID, "typing")
+		placeholderID, _ := r.api.SendMessageID(ctx, m.Chat.ID, "Thinking…")
+		stopSpinner := r.startSpinner(ctx, m.Chat.ID, placeholderID, "Thinking…")
 		answer, err := r.brain.Handle(ctx, text, m.Chat.ID, originInboxID)
+		stopSpinner()
 		if err != nil {
 			r.log.Warn("LLM request failed; saved message as note", "error", err)
 			if _, saveErr := notes.New(r.db).AddWithOrigin(ctx, text, noteSource(originInboxID), originInboxID); saveErr != nil {
 				return saveErr
 			}
+			if placeholderID > 0 {
+				return r.api.EditMessageText(ctx, m.Chat.ID, placeholderID, "I couldn't process that with the chat assistant, so I saved it as a note.")
+			}
 			return r.api.SendMessage(ctx, m.Chat.ID, "I couldn't process that with the chat assistant, so I saved it as a note.")
 		}
 		if strings.TrimSpace(answer) == "" {
+			if placeholderID > 0 {
+				return r.api.DeleteMessage(ctx, m.Chat.ID, placeholderID)
+			}
 			return nil
 		}
-		return r.api.SendMessage(ctx, m.Chat.ID, answer)
+		return r.sendLongWithFirst(ctx, m.Chat.ID, placeholderID, answer)
 	}
 }
 
+var searchPrefixes = []string{"search ", "search for ", "find ", "find me ", "look for ", "look up ", "where is ", "show me "}
+
 func isLocalSearch(text string) bool {
 	lower := strings.ToLower(strings.TrimSpace(text))
-	for _, prefix := range []string{"search ", "find ", "look for ", "where is "} {
+	for _, prefix := range searchPrefixes {
 		if strings.HasPrefix(lower, prefix) {
 			return true
 		}
@@ -293,7 +487,8 @@ func isLocalSearch(text string) bool {
 func searchRemainder(text string) string {
 	trimmed := strings.TrimSpace(text)
 	lower := strings.ToLower(trimmed)
-	for _, prefix := range []string{"search ", "find ", "look for ", "where is "} {
+	// Longest prefix first, so "search for x" does not leave "for x".
+	for _, prefix := range []string{"search for ", "find me ", "search ", "find ", "look for ", "look up ", "where is ", "show me "} {
 		if strings.HasPrefix(lower, prefix) {
 			return strings.TrimSpace(trimmed[len(prefix):])
 		}
@@ -301,20 +496,119 @@ func searchRemainder(text string) string {
 	return trimmed
 }
 
-func (r *Router) replySearch(ctx context.Context, chatID int64, query string) error {
-	results, mode, err := search.Query(ctx, r.db.DB, query, 10, 0)
+// isExplicitWeb reports whether the user explicitly asked for a web/online
+// search. A topic that merely contains the word "web" (e.g. "web
+// development") is not explicit.
+func isExplicitWeb(text string) bool {
+	lower := " " + strings.ToLower(strings.TrimSpace(text)) + " "
+	for _, phrase := range []string{" on the web ", " on web ", " online ", " on the internet ", " from the internet ", " search web ", " search the web ", " search online ", " web search ", " google it ", " google "} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// explicitWebQuery strips the "search the web for" phrasing, leaving the
+// topic to search locally first, then on the web if local is empty.
+func explicitWebQuery(text string) string {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	for _, prefix := range []string{"search the web for ", "search web for ", "search online for ", "search the internet for ", "google ", "google for "} {
+		if strings.HasPrefix(lower, prefix) {
+			return strings.TrimSpace(text[len(prefix):])
+		}
+	}
+	return strings.TrimSpace(text)
+}
+
+// handleSearchRequest is the local-first search policy the user asked for:
+//  1. Always search the local notes/files index first.
+//  2. If local results exist, send only those — never the web.
+//  3. Only when local finds nothing, fall back to a web report (via the
+//     brain's report path, which uses Firecrawl + LLM on public content
+//     only, never on file contents), and say so explicitly.
+func (r *Router) handleSearchRequest(ctx context.Context, chatID int64, query string) error {
+	if strings.TrimSpace(query) == "" {
+		return r.api.SendMessage(ctx, chatID, "Usage: /find <query>")
+	}
+	_ = r.api.SendChatAction(ctx, chatID, "typing")
+	found, err := r.sendLocalSearch(ctx, chatID, query, 0)
 	if err != nil {
-		return r.api.SendMessage(ctx, chatID, "I couldn't parse that search. Use dates as YYYY-MM-DD.")
+		return err
+	}
+	if found {
+		return nil
+	}
+	if r.brain == nil || !r.brain.HasWeb() {
+		return r.api.SendMessage(ctx, chatID, "🔍 No local matches found.\n\nTip: send a file or note first, or say “search the web for …” if web search is configured.")
+	}
+	placeholderID, _ := r.api.SendMessageID(ctx, chatID, "🔍 No local matches — searching the web…")
+	report, err := r.brain.RunReport(ctx, chatID, query)
+	if err != nil {
+		if placeholderID > 0 {
+			return r.api.EditMessageText(ctx, chatID, placeholderID, "🔍 No local matches found, and the web search failed. Try a different word.")
+		}
+		return r.api.SendMessage(ctx, chatID, "🔍 No local matches found, and the web search failed. Try a different word.")
+	}
+	return r.sendLongWithFirst(ctx, chatID, placeholderID, "🌐 No local matches, so here is what I found on the web:\n\n"+report)
+}
+
+// sendLocalSearch runs one local page and sends it if there are results.
+// It returns false (without sending a "no matches" message) when empty, so
+// the caller can decide on a web fallback.
+func (r *Router) sendLocalSearch(ctx context.Context, chatID int64, query string, offset int) (bool, error) {
+	results, mode, err := search.Query(ctx, r.db.DB, query, 10, offset)
+	if err != nil {
+		_ = r.api.SendMessage(ctx, chatID, "I couldn't parse that search. Use dates as YYYY-MM-DD.")
+		return false, err
 	}
 	if len(results) == 0 {
-		return r.api.SendMessage(ctx, chatID, "🔍 No matches found.")
+		return false, nil
 	}
+	r.searchMu.Lock()
+	r.searchSeq++
+	seq := r.searchSeq
+	if len(r.searches) > 50 {
+		for k := range r.searches {
+			delete(r.searches, k)
+			break
+		}
+	}
+	r.searches[seq] = searchState{query: query, offset: offset}
+	r.searchMu.Unlock()
+	answer, keyboard := formatSearchResults(results, mode, offset, seq)
+	if len(keyboard) > 0 {
+		_, err := r.api.SendMessageWithKeyboardID(ctx, chatID, answer, telegram.InlineKeyboardMarkup{InlineKeyboard: keyboard})
+		return true, err
+	}
+	return true, r.api.SendMessage(ctx, chatID, answer)
+}
+
+func (r *Router) replySearch(ctx context.Context, chatID int64, query string, offset int) error {
+	found, err := r.sendLocalSearch(ctx, chatID, query, offset)
+	if err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	if offset > 0 {
+		return r.api.SendMessage(ctx, chatID, "🔍 No more results.")
+	}
+	return r.api.SendMessage(ctx, chatID, "🔍 No local matches found.")
+}
+
+func formatSearchResults(results []search.Result, mode string, offset int, seq int64) (string, [][]telegram.InlineKeyboardButton) {
 	var b strings.Builder
 	noun := "results"
 	if len(results) == 1 {
 		noun = "result"
 	}
-	fmt.Fprintf(&b, "🔍 %d %s (%s match)\n", len(results), noun, mode)
+	if offset > 0 {
+		fmt.Fprintf(&b, "🔍 Local search — %d %s (%s match) · page %d\n", len(results), noun, mode, offset/10+1)
+	} else {
+		fmt.Fprintf(&b, "🔍 Local search — %d %s (%s match)\n", len(results), noun, mode)
+	}
 	var keyboard [][]telegram.InlineKeyboardButton
 	for i, item := range results {
 		icon := "📝"
@@ -322,29 +616,115 @@ func (r *Router) replySearch(ctx context.Context, chatID int64, query string) er
 			icon = "📄"
 		}
 		b.WriteString("\n")
+		num := offset + i + 1
 		if item.Page > 0 {
-			fmt.Fprintf(&b, "%d. %s %s · p.%d\n", i+1, icon, clip(item.Title, 44), item.Page)
+			fmt.Fprintf(&b, "%d. %s %s · p.%d\n", num, icon, clip(item.Title, 44), item.Page)
 		} else {
-			fmt.Fprintf(&b, "%d. %s %s\n", i+1, icon, clip(item.Title, 44))
+			fmt.Fprintf(&b, "%d. %s %s\n", num, icon, clip(item.Title, 44))
 		}
 		if s := strings.TrimSpace(cleanSnippet(item.Snippet)); s != "" {
 			fmt.Fprintf(&b, "   %s\n", clip(s, 160))
 		}
 		if item.Kind == "file" {
 			keyboard = append(keyboard, []telegram.InlineKeyboardButton{
-				{Text: fmt.Sprintf("👁 Preview %d", i+1), CallbackData: fmt.Sprintf("file:preview:%d", item.RefID)},
-				{Text: fmt.Sprintf("📤 Send %d", i+1), CallbackData: fmt.Sprintf("file:send:%d", item.RefID)},
+				{Text: fmt.Sprintf("👁 Preview %d", num), CallbackData: fmt.Sprintf("file:preview:%d", item.RefID)},
+				{Text: fmt.Sprintf("📤 Send %d", num), CallbackData: fmt.Sprintf("file:send:%d", item.RefID)},
 			})
 		}
 	}
-	answer := b.String()
-	if len(answer) > 3900 {
-		answer = answer[:3900]
+	var pageRow []telegram.InlineKeyboardButton
+	if offset > 0 {
+		pageRow = append(pageRow, telegram.InlineKeyboardButton{Text: "⬅ Prev", CallbackData: fmt.Sprintf("search:prev:%d", seq)})
 	}
-	if len(keyboard) > 0 {
-		return r.api.SendMessageWithKeyboard(ctx, chatID, answer, telegram.InlineKeyboardMarkup{InlineKeyboard: keyboard})
+	if len(results) == 10 {
+		pageRow = append(pageRow, telegram.InlineKeyboardButton{Text: "Next ➡", CallbackData: fmt.Sprintf("search:next:%d", seq)})
 	}
-	return r.api.SendMessage(ctx, chatID, answer)
+	if len(pageRow) > 0 {
+		keyboard = append(keyboard, pageRow)
+	}
+	return truncateRunes(b.String(), 3900), keyboard
+}
+
+func (r *Router) handleSearchPage(ctx context.Context, q telegram.CallbackQuery, seq int64, delta int) error {
+	r.searchMu.Lock()
+	state, ok := r.searches[seq]
+	if ok {
+		state.offset += delta
+		if state.offset < 0 {
+			state.offset = 0
+		}
+		r.searches[seq] = state
+	}
+	r.searchMu.Unlock()
+	if !ok || q.Message == nil {
+		return r.api.AnswerCallback(ctx, q.ID, "Search expired — send /find again")
+	}
+	results, mode, err := search.Query(ctx, r.db.DB, state.query, 10, state.offset)
+	if err != nil {
+		return r.api.AnswerCallback(ctx, q.ID, "Search failed")
+	}
+	if len(results) == 0 {
+		// Step back so the next Prev still works from the last good page.
+		r.searchMu.Lock()
+		state.offset -= delta
+		if state.offset < 0 {
+			state.offset = 0
+		}
+		r.searches[seq] = state
+		r.searchMu.Unlock()
+		return r.api.AnswerCallback(ctx, q.ID, "No more results")
+	}
+	answer, keyboard := formatSearchResults(results, mode, state.offset, seq)
+	_ = r.api.EditMessageKeyboard(ctx, q.Message.Chat.ID, q.Message.MessageID, answer, telegram.InlineKeyboardMarkup{InlineKeyboard: keyboard})
+	return r.api.AnswerCallback(ctx, q.ID, "")
+}
+
+func (r *Router) handleMenu(ctx context.Context, q telegram.CallbackQuery, action string) error {
+	if q.Message == nil {
+		return r.api.AnswerCallback(ctx, q.ID, "Unavailable")
+	}
+	chatID, msgID := q.Message.Chat.ID, q.Message.MessageID
+	switch action {
+	case "home":
+		_ = r.api.EditMessageKeyboard(ctx, chatID, msgID, "🏠 Second Brain menu", menuKeyboard())
+	case "today":
+		body, err := r.todayAgenda(ctx)
+		if err != nil {
+			return r.api.AnswerCallback(ctx, q.ID, "Couldn't load today")
+		}
+		_ = r.api.EditMessageKeyboard(ctx, chatID, msgID, body, backToMenuKeyboard())
+	case "reminders":
+		body, err := r.reminders.ListReminders(ctx)
+		if err != nil {
+			return r.api.AnswerCallback(ctx, q.ID, "Couldn't load reminders")
+		}
+		_ = r.api.EditMessageKeyboard(ctx, chatID, msgID, body, backToMenuKeyboard())
+	case "tasks":
+		body, err := r.reminders.ListTasks(ctx)
+		if err != nil {
+			return r.api.AnswerCallback(ctx, q.ID, "Couldn't load tasks")
+		}
+		_ = r.api.EditMessageKeyboard(ctx, chatID, msgID, body, backToMenuKeyboard())
+	case "files":
+		_ = r.api.EditMessageKeyboard(ctx, chatID, msgID, "📂 Your files — choose a category:", filesCategoryKeyboard())
+	case "schedules":
+		if r.brain == nil {
+			_ = r.api.EditMessageKeyboard(ctx, chatID, msgID, "Scheduled tasks are unavailable because the assistant is not configured.", backToMenuKeyboard())
+			break
+		}
+		body, err := r.brain.ListSchedules(ctx, chatID)
+		if err != nil {
+			return r.api.AnswerCallback(ctx, q.ID, "Couldn't load schedules")
+		}
+		_ = r.api.EditMessageKeyboard(ctx, chatID, msgID, body, backToMenuKeyboard())
+	case "status":
+		_ = r.api.EditMessageKeyboard(ctx, chatID, msgID, r.status(ctx), backToMenuKeyboard())
+	case "help":
+		_ = r.api.EditMessageKeyboard(ctx, chatID, msgID, helpText, menuKeyboard())
+	default:
+		return r.api.AnswerCallback(ctx, q.ID, "Unknown action")
+	}
+	return r.api.AnswerCallback(ctx, q.ID, "")
 }
 func shortName(name string) string {
 	if len([]rune(name)) > 20 {
@@ -353,12 +733,80 @@ func shortName(name string) string {
 	return name
 }
 
+// spinnerFrames are the Braille spinner used for "live" placeholder
+// messages. Telegram bots have no native animation, so editing the
+// placeholder on a timer is the way to show work in progress.
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// startSpinner edits messageID every 700 ms with a spinning frame until
+// stop is called. Call stop before editing the message to its final text,
+// so the final edit cannot be overwritten by a late frame. Safe to call
+// with messageID 0, in which case it is a no-op.
+func (r *Router) startSpinner(ctx context.Context, chatID, messageID int64, base string) func() {
+	if messageID == 0 {
+		return func() {}
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(700 * time.Millisecond)
+		defer ticker.Stop()
+		i := 0
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				_ = r.api.EditMessageText(ctx, chatID, messageID, fmt.Sprintf("%s %s", base, spinnerFrames[i%len(spinnerFrames)]))
+				i++
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		wg.Wait()
+	}
+}
+
+// clearMessage rewrites a message and removes its buttons, so a tap is
+// visible in the chat itself — not only as a toast that disappears.
+// Telegram treats an empty inline_keyboard as "remove the keyboard".
+func (r *Router) clearMessage(ctx context.Context, chatID, msgID int64, text string) {
+	// If the edit fails (e.g. the message is too old to edit), send a
+	// new message instead — a tap must never silently do nothing.
+	if err := r.api.EditMessageKeyboard(ctx, chatID, msgID, text, telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{}}); err != nil {
+		_ = r.api.SendMessage(ctx, chatID, text)
+	}
+}
+
+func (r *Router) transcriptText(ctx context.Context, id, userID int64) string {
+	var text string
+	_ = r.db.QueryRowContext(ctx, `SELECT text FROM pending_transcripts WHERE id=? AND user_id=?`, id, userID).Scan(&text)
+	return text
+}
+
 func (r *Router) handleCallback(ctx context.Context, q telegram.CallbackQuery) error {
 	if !AllowedUser(q.From.ID, r.cfg.AllowedUserID) {
 		r.log.Info("ignored callback", "callback_id", q.ID)
 		return nil
 	}
 	parts := strings.Split(q.Data, ":")
+	if len(parts) == 2 && parts[0] == "menu" {
+		return r.handleMenu(ctx, q, parts[1])
+	}
+	if len(parts) == 3 && parts[0] == "search" && (parts[1] == "next" || parts[1] == "prev") {
+		seq, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil {
+			return r.api.AnswerCallback(ctx, q.ID, "Invalid search")
+		}
+		delta := 10
+		if parts[1] == "prev" {
+			delta = -10
+		}
+		return r.handleSearchPage(ctx, q, seq, delta)
+	}
 	if len(parts) == 3 && parts[0] == "confirm" {
 		id, err := strconv.ParseInt(parts[2], 10, 64)
 		if err != nil {
@@ -371,6 +819,13 @@ func (r *Router) handleCallback(ctx context.Context, q telegram.CallbackQuery) e
 		if err != nil {
 			return r.api.AnswerCallback(ctx, q.ID, "Confirmation expired or failed")
 		}
+		if q.Message != nil {
+			if parts[1] == "yes" {
+				r.clearMessage(ctx, q.Message.Chat.ID, q.Message.MessageID, "✅ Confirmed — action completed.")
+			} else {
+				r.clearMessage(ctx, q.Message.Chat.ID, q.Message.MessageID, "❌ Cancelled — no action taken.")
+			}
+		}
 		return r.api.AnswerCallback(ctx, q.ID, "Action updated")
 	}
 	if len(parts) == 3 && parts[0] == "voice" {
@@ -378,6 +833,7 @@ func (r *Router) handleCallback(ctx context.Context, q telegram.CallbackQuery) e
 		if err != nil {
 			return r.api.AnswerCallback(ctx, q.ID, "Invalid transcript")
 		}
+		transcript := r.transcriptText(ctx, id, q.From.ID)
 		switch parts[1] {
 		case "undo":
 			err = r.undoTranscript(ctx, id, q.From.ID)
@@ -388,6 +844,13 @@ func (r *Router) handleCallback(ctx context.Context, q telegram.CallbackQuery) e
 		}
 		if err != nil {
 			return r.api.AnswerCallback(ctx, q.ID, "Transcript action expired or failed")
+		}
+		if q.Message != nil {
+			if parts[1] == "edit" {
+				r.clearMessage(ctx, q.Message.Chat.ID, q.Message.MessageID, fmt.Sprintf("✏️ Editing — send the corrected text as your next message.\n\nOriginal: %s", clip(transcript, 300)))
+			} else {
+				r.clearMessage(ctx, q.Message.Chat.ID, q.Message.MessageID, fmt.Sprintf("↩️ Undone — the note, reminder and task from this voice note were removed.\n\nOriginal: %s", clip(transcript, 300)))
+			}
 		}
 		if parts[1] == "edit" {
 			return r.api.AnswerCallback(ctx, q.ID, "Send the corrected transcript as your next message")
@@ -439,6 +902,13 @@ func (r *Router) handleCallback(ctx context.Context, q telegram.CallbackQuery) e
 		if err != nil {
 			return r.api.AnswerCallback(ctx, q.ID, "Delete failed or confirmation expired")
 		}
+		if q.Message != nil {
+			if parts[1] == "yes" {
+				r.clearMessage(ctx, q.Message.Chat.ID, q.Message.MessageID, "🗑 Deleted permanently.")
+			} else {
+				r.clearMessage(ctx, q.Message.Chat.ID, q.Message.MessageID, "✅ Kept — file was not deleted.")
+			}
+		}
 		return r.api.AnswerCallback(ctx, q.ID, "File action complete")
 	}
 	if len(parts) != 3 || parts[0] != "reminder" {
@@ -448,6 +918,7 @@ func (r *Router) handleCallback(ctx context.Context, q telegram.CallbackQuery) e
 	if err != nil {
 		return r.api.AnswerCallback(ctx, q.ID, "Invalid reminder")
 	}
+	body, due, _ := r.reminders.Get(ctx, id)
 	switch parts[1] {
 	case "done":
 		err = r.reminders.Done(ctx, id)
@@ -455,11 +926,37 @@ func (r *Router) handleCallback(ctx context.Context, q telegram.CallbackQuery) e
 		err = r.reminders.Snooze(ctx, id, 10*time.Minute)
 	case "snooze60":
 		err = r.reminders.Snooze(ctx, id, time.Hour)
+	case "snoozeDay":
+		err = r.reminders.Snooze(ctx, id, 24*time.Hour)
 	default:
 		return r.api.AnswerCallback(ctx, q.ID, "Unknown action")
 	}
 	if err != nil {
 		return err
+	}
+	if q.Message != nil {
+		chatID, msgID := q.Message.Chat.ID, q.Message.MessageID
+		switch parts[1] {
+		case "done":
+			r.clearMessage(ctx, chatID, msgID, fmt.Sprintf("✅ Done\n%s", body))
+		case "snooze10", "snooze60", "snoozeDay":
+			when := time.Now().Add(10 * time.Minute)
+			if parts[1] == "snooze60" {
+				when = time.Now().Add(time.Hour)
+			}
+			if parts[1] == "snoozeDay" {
+				when = time.Now().Add(24 * time.Hour)
+			}
+			// Keep buttons on a snoozed reminder so it can still be
+			// done or snoozed again, but rewrite the text so the tap
+			// is unmistakable.
+			kb := telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
+				{{Text: "✅ Done", CallbackData: fmt.Sprintf("reminder:done:%d", id)}, {Text: "⏰ Snooze 10 min", CallbackData: fmt.Sprintf("reminder:snooze10:%d", id)}},
+				{{Text: "⏰ Snooze 1 h", CallbackData: fmt.Sprintf("reminder:snooze60:%d", id)}, {Text: "⏰ Tomorrow", CallbackData: fmt.Sprintf("reminder:snoozeDay:%d", id)}},
+			}}
+			_ = r.api.EditMessageKeyboard(ctx, chatID, msgID, fmt.Sprintf("⏰ Snoozed until %s\n%s", when.In(r.reminders.Location()).Format("Mon Jan 2 15:04"), body), kb)
+		}
+		_ = due
 	}
 	return r.api.AnswerCallback(ctx, q.ID, "Reminder updated")
 }
@@ -486,9 +983,17 @@ func (r *Router) createReminderFrom(ctx context.Context, chatID int64, input str
 	if err != nil {
 		return r.api.SendMessage(ctx, chatID, "Couldn't create reminder: "+err.Error())
 	}
-	message := fmt.Sprintf("Reminder #%d set for %s.", id, due.In(r.reminders.Location()).Format("Mon Jan 2, 15:04"))
-	if critical && (r.cfg.NtfyURL == "" || r.cfg.NtfyToken == "") {
-		message += " ntfy is not configured, so phone alarm repeats are unavailable."
+	message := fmt.Sprintf("⏰ Reminder #%d set for %s.", id, due.In(r.reminders.Location()).Format("Mon Jan 2, 15:04"))
+	if reminders.IsUrgent(body) {
+		critical = true
+	}
+	if critical {
+		message += "\n🚨 Critical alarm — ntfy at max priority (5), repeating every 5 min until you tap Done."
+		if r.cfg.NtfyURL == "" || r.cfg.NtfyToken == "" {
+			message += " ntfy is not configured, so phone alarm repeats are unavailable."
+		} else {
+			message += "\n📱 For this to ring when silent: allow ntfy to bypass Do Not Disturb/Focus on your phone. A silent switch or a Focus that blocks ntfy cannot be overridden from the server."
+		}
 	}
 	return r.api.SendMessage(ctx, chatID, message)
 }
@@ -516,20 +1021,33 @@ func (r *Router) handleVoice(ctx context.Context, m *telegram.Message, inboxID i
 	path := file.Name()
 	_ = file.Close()
 	_ = os.Remove(path)
+	_ = r.api.SendChatAction(ctx, m.Chat.ID, "typing")
+	placeholderID, _ := r.api.SendMessageID(ctx, m.Chat.ID, "🎙 Transcribing…")
+	stopSpinner := r.startSpinner(ctx, m.Chat.ID, placeholderID, "🎙 Transcribing…")
 	_, err = r.api.DownloadFile(ctx, m.Voice.FileID, path, stt.MaxFreeRequestBytes)
 	if err != nil {
-		_ = r.api.SendMessage(ctx, m.Chat.ID, "I couldn't download that voice note. Please try sending it again.")
+		stopSpinner()
+		if placeholderID > 0 {
+			_ = r.api.EditMessageText(ctx, m.Chat.ID, placeholderID, "I couldn't download that voice note. Please try sending it again.")
+		} else {
+			_ = r.api.SendMessage(ctx, m.Chat.ID, "I couldn't download that voice note. Please try sending it again.")
+		}
 		return err
 	}
 	defer os.Remove(path)
 	transcriber := stt.New(r.cfg.GroqAPIKey, r.cfg.STTModel, r.cfg.STTLanguage)
 	transcript, err := transcriber.Transcribe(ctx, path, r.cfg.STTLanguage, r.cfg.TempDir)
+	stopSpinner()
 	if err != nil {
 		message := "I couldn't transcribe that voice note. Please try again."
 		if apiErr, ok := err.(*stt.APIError); ok && apiErr.Status == 429 {
 			message = "Voice transcription is rate-limited right now. Please wait a little and resend the voice note."
 		}
-		_ = r.api.SendMessage(ctx, m.Chat.ID, message)
+		if placeholderID > 0 {
+			_ = r.api.EditMessageText(ctx, m.Chat.ID, placeholderID, message)
+		} else {
+			_ = r.api.SendMessage(ctx, m.Chat.ID, message)
+		}
 		return err
 	}
 	res, err := r.db.ExecContext(ctx, `INSERT INTO pending_transcripts(user_id,chat_id,text,created_at,status,origin_inbox_id) VALUES(?,?,?,?, 'processed',?)`, m.From.ID, m.Chat.ID, transcript, time.Now().UTC().Format(time.RFC3339Nano), inboxID)
@@ -541,7 +1059,11 @@ func (r *Router) handleVoice(ctx context.Context, m *telegram.Message, inboxID i
 		return err
 	}
 	kb := telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{{{Text: "Edit", CallbackData: fmt.Sprintf("voice:edit:%d", transcriptID)}, {Text: "Undo", CallbackData: fmt.Sprintf("voice:undo:%d", transcriptID)}}}}
-	if err := r.api.SendMessageWithKeyboard(ctx, m.Chat.ID, "Heard: "+transcript, kb); err != nil {
+	if placeholderID > 0 {
+		if err := r.api.EditMessageKeyboard(ctx, m.Chat.ID, placeholderID, "Heard: "+transcript, kb); err != nil {
+			return err
+		}
+	} else if err := r.api.SendMessageWithKeyboard(ctx, m.Chat.ID, "Heard: "+transcript, kb); err != nil {
 		return err
 	}
 	return r.handleTextFromInbox(ctx, m, transcript, inboxID)
@@ -604,7 +1126,11 @@ func (r *Router) handleFile(ctx context.Context, m *telegram.Message) error {
 	if saved.Duplicate {
 		return r.api.SendMessage(ctx, m.Chat.ID, fmt.Sprintf("That file is already saved as #%d (%s).", saved.ID, saved.Name))
 	}
-	messageID, err := r.api.SendMessageID(ctx, m.Chat.ID, fmt.Sprintf("Saved %s (%s). Indexing in background.", saved.Name, formatBytes(saved.Size)))
+	savedText := fmt.Sprintf("✅ Saved %s (%s). Indexing in background.", saved.Name, formatBytes(saved.Size))
+	if len(m.Photo) > 0 {
+		savedText += "\n📸 Photo received compressed — for sharper OCR, next time send it as a File."
+	}
+	messageID, err := r.api.SendMessageID(ctx, m.Chat.ID, savedText)
 	if err != nil {
 		return err
 	}
@@ -713,7 +1239,7 @@ func (r *Router) status(ctx context.Context) string {
 	if upcoming == "" {
 		upcoming = "none"
 	}
-	return fmt.Sprintf("Second Brain Bot\nUptime: %s\nAvailable RAM: %s\nAvailable swap: %s\nDisk: %s\nQueued jobs: %d\nFailed jobs: %d (latest: %s)\nLLM tokens today: %d\nNext reminder: %s", time.Since(r.startedAt).Round(time.Second), readMem("MemAvailable"), readMem("SwapFree"), diskUsage(r.cfg.DataDir), queue, failed, lastError, tokens, upcoming)
+	return fmt.Sprintf("🤖 Second Brain\n──────────────\n⏱ Uptime: %s\n🧠 Available RAM: %s\n🔄 Available swap: %s\n💾 Disk: %s\n📥 Queued jobs: %d\n⚠️ Failed jobs: %d (latest: %s)\n💬 LLM tokens today: %d\n⏰ Next reminder: %s", time.Since(r.startedAt).Round(time.Second), readMem("MemAvailable"), readMem("SwapFree"), diskUsage(r.cfg.DataDir), queue, failed, lastError, tokens, upcoming)
 }
 
 func filesCategoryKeyboard() telegram.InlineKeyboardMarkup {

@@ -103,6 +103,27 @@ func main() {
 	scheduleService := scheduler.New(database, api, brain, fileService, reminderService.Location(), cfg.TempDir, logger)
 	go scheduleService.Run(ctx)
 	handler := router.New(cfg, database, api, reminderService, brain, fileService, backupService, logger)
+	// Best effort only: a failed menu update must never stop the bot.
+	// This gives Telegram's built-in command list without BotFather steps.
+	_ = api.SetMyCommands(ctx, []telegram.BotCommand{
+		{Command: "menu", Description: "Quick actions"},
+		{Command: "today", Description: "Today's reminders and open tasks"},
+		{Command: "note", Description: "Save a note"},
+		{Command: "find", Description: "Search notes and files locally"},
+		{Command: "remind", Description: "Set a reminder"},
+		{Command: "reminders", Description: "Upcoming reminders"},
+		{Command: "schedules", Description: "Scheduled reports and messages"},
+		{Command: "task", Description: "Add a task"},
+		{Command: "tasks", Description: "Open tasks"},
+		{Command: "done", Description: "Mark a reminder or task done"},
+		{Command: "cancel", Description: "Cancel a reminder"},
+		{Command: "files", Description: "Browse saved files"},
+		{Command: "status", Description: "Bot and VM status"},
+		{Command: "usage", Description: "LLM tokens today"},
+		{Command: "backup", Description: "Run an encrypted backup"},
+		{Command: "forget", Description: "Clear recent chat memory"},
+		{Command: "help", Description: "Show help and quick actions"},
+	})
 	var offset int64
 	for ctx.Err() == nil {
 		updates, err := api.GetUpdates(ctx, offset)

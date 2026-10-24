@@ -220,7 +220,7 @@ func (w *Worker) indexPDF(ctx context.Context, id int64, name, caption, tags, pa
 			return e
 		}
 		if page%5 == 0 || page == pages {
-			w.progress(progressID, fmt.Sprintf("Indexing %s: %d/%d pages", name, page, pages))
+			w.progress(progressID, fmt.Sprintf("Indexing %s %s — %d/%d pages", name, progressBar(page, pages), page, pages))
 		}
 	}
 	var ocrPages int
@@ -229,14 +229,25 @@ func (w *Worker) indexPDF(ctx context.Context, id int64, name, caption, tags, pa
 	}
 	_, err = w.db.ExecContext(ctx, `UPDATE files SET index_status='done',pages=?,ocr_pages=? WHERE id=?`, pages, ocrPages, id)
 	if err == nil {
-		w.progress(progressID, fmt.Sprintf("Indexed %s: %d pages, %d OCR'd.", name, pages, ocrPages))
+		w.progress(progressID, fmt.Sprintf("✅ Indexed %s: %d pages, %d OCR'd.", name, pages, ocrPages))
 	}
 	_ = ocrCount
 	return err
 }
 
+// progressBar renders a small text progress bar for edited progress
+// messages, e.g. "▓▓▓▓░░░░ 40%". Telegram has no native progress bar.
+func progressBar(done, total int) string {
+	if total <= 0 {
+		return ""
+	}
+	pct := done * 100 / total
+	filled := pct * 10 / 100
+	return fmt.Sprintf("%s%s %d%%", strings.Repeat("▓", filled), strings.Repeat("░", 10-filled), pct)
+}
+
 func (w *Worker) indexImage(ctx context.Context, id int64, name, caption, tags, path string, progressID int64) error {
-	text, err := w.runTesseract(ctx, path)
+	text, err := w.bestOCR(ctx, path)
 	if err != nil {
 		return err
 	}
@@ -246,7 +257,11 @@ func (w *Worker) indexImage(ctx context.Context, id int64, name, caption, tags, 
 	}
 	_, err = w.db.ExecContext(ctx, `UPDATE files SET index_status='done',pages=1,ocr_pages=1 WHERE id=?`, id)
 	if err == nil {
-		w.progress(progressID, fmt.Sprintf("Indexed %s: 1 image OCR'd.", name))
+		if strings.TrimSpace(text) == "" {
+			w.progress(progressID, fmt.Sprintf("Indexed %s: OCR found no readable text. For sharper text, send the image as a File (not a Photo) — Telegram compresses photos.", name))
+		} else {
+			w.progress(progressID, fmt.Sprintf("✅ Indexed %s: 1 image OCR'd.", name))
+		}
 	}
 	return err
 }
@@ -396,19 +411,85 @@ func (w *Worker) ocrPDFPage(ctx context.Context, pdf string, page int, id int64)
 	if _, err := runCommand(ctx, commandTimeout, "pdftoppm", "-f", strconv.Itoa(page), "-l", strconv.Itoa(page), "-singlefile", "-r", strconv.Itoa(w.cfg.OCRDPI), "-png", "-gray", pdf, prefix); err != nil {
 		return "", err
 	}
-	return w.runTesseract(ctx, image)
+	return w.bestOCR(ctx, image)
 }
 
 func (w *Worker) runTesseract(ctx context.Context, path string) (string, error) {
+	return w.runTesseractPSM(ctx, path, "6")
+}
+
+// runTesseractPSM runs tesseract with an explicit page segmentation mode.
+// PSM 6 (uniform block of text) is the best default for documents and
+// screenshots, where the old default PSM 3 often mis-split the page.
+func (w *Worker) runTesseractPSM(ctx context.Context, path, psm string) (string, error) {
 	cmdCtx, cancel := context.WithTimeout(ctx, commandTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(cmdCtx, "tesseract", path, "stdout", "--oem", "1", "-l", w.cfg.OCRLangs, "-c", "preserve_interword_spaces=1")
+	cmd := exec.CommandContext(cmdCtx, "tesseract", path, "stdout", "--oem", "1", "--psm", psm, "-l", w.cfg.OCRLangs, "-c", "preserve_interword_spaces=1")
 	cmd.Env = append(os.Environ(), "OMP_THREAD_LIMIT=1")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("tesseract: %w", err)
 	}
 	return string(out), nil
+}
+
+// bestOCR tries several cheap, single-image passes and keeps the longest
+// readable result. This matters because Telegram photos are compressed
+// and low-contrast, and one PSM rarely fits every photo. It stays
+// sequential (one image at a time) to respect the small VM, and any
+// preprocessing failure falls back to the raw pass instead of failing.
+func (w *Worker) bestOCR(ctx context.Context, path string) (string, error) {
+	best, err := w.runTesseractPSM(ctx, path, "6")
+	if err != nil {
+		return "", err
+	}
+	if utf8.RuneCountInString(strings.TrimSpace(best)) >= 20 {
+		return best, nil
+	}
+	if pre, cleanup, err := w.preprocessImage(ctx, path); err == nil {
+		defer cleanup()
+		if text, err := w.runTesseractPSM(ctx, pre, "6"); err == nil && utf8.RuneCountInString(strings.TrimSpace(text)) > utf8.RuneCountInString(strings.TrimSpace(best)) {
+			best = text
+		}
+		if utf8.RuneCountInString(strings.TrimSpace(best)) < 20 {
+			if text, err := w.runTesseractPSM(ctx, pre, "11"); err == nil && utf8.RuneCountInString(strings.TrimSpace(text)) > utf8.RuneCountInString(strings.TrimSpace(best)) {
+				best = text
+			}
+		}
+	}
+	return best, nil
+}
+
+// preprocessImage returns a grayscale, contrast-normalised, sharpened copy
+// of an image, upscaled to at least 2000 px wide if it is smaller.
+// Tesseract is very sensitive to small, low-contrast text, which is
+// exactly what compressed Telegram photos produce. Uses ImageMagick
+// (convert, falling back to magick); returns an error if neither exists.
+func (w *Worker) preprocessImage(ctx context.Context, path string) (string, func(), error) {
+	cleanup := func() {}
+	out, err := os.CreateTemp(w.cfg.TempDir, "ocr-pre-*.png")
+	if err != nil {
+		return "", cleanup, err
+	}
+	outPath := out.Name()
+	_ = out.Close()
+	cleanup = func() { _ = os.Remove(outPath) }
+	width := 0
+	if info, err := runCommand(ctx, commandTimeout, "identify", "-format", "%w", path); err == nil {
+		width, _ = strconv.Atoi(strings.TrimSpace(string(info)))
+	}
+	args := []string{path, "-colorspace", "Gray", "-normalize", "-sharpen", "0x1"}
+	if width > 0 && width < 2000 {
+		args = append(args, "-resize", "2000x")
+	}
+	args = append(args, outPath)
+	for _, tool := range []string{"convert", "magick"} {
+		if _, err := runCommand(ctx, commandTimeout, tool, args...); err == nil {
+			return outPath, cleanup, nil
+		}
+	}
+	cleanup()
+	return "", func() {}, fmt.Errorf("no ImageMagick convert/magick available")
 }
 
 func (w *Worker) findImagePages(ctx context.Context, pdf string) (map[int]bool, error) {

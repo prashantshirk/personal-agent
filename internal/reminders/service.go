@@ -25,7 +25,23 @@ func(s *Service)AddReminder(ctx context.Context,when,text,repeat string,critical
 }
 func(s *Service)AddTask(ctx context.Context,body string)(int64,error){return s.AddTaskFrom(ctx,body,0)}
 func(s *Service)AddTaskFrom(ctx context.Context,body string,origin int64)(int64,error){res,err:=s.db.ExecContext(ctx,`INSERT INTO tasks(created_at,body,origin_inbox_id) VALUES(?,?,NULLIF(?,0))`,time.Now().UTC().Format(time.RFC3339),strings.TrimSpace(body),origin);if err!=nil{return 0,err};return res.LastInsertId()}
+// IsUrgent reports whether reminder wording asks for a max-priority alarm.
+// This is deterministic, not left to the LLM: any of these phrases in the
+// reminder text forces critical=true, whatever the caller passed.
+func IsUrgent(text string) bool {
+	lower := " " + strings.ToLower(strings.TrimSpace(text)) + " "
+	for _, phrase := range []string{" urgent ", " critical ", " max priority ", " maximum priority ", " highest priority ", " very important ", " emergency ", " alarm ", " wake me ", " ring ", " asap ", " very very "} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
 func(s *Service)AddReminderFrom(ctx context.Context,when,text,repeat string,critical bool,origin int64)(int64,time.Time,error){
+	if IsUrgent(text) {
+		critical = true
+	}
 	due,err:=ParseWhen(when,time.Now(),s.loc);if err!=nil{return 0,time.Time{},err};if strings.TrimSpace(text)==""{return 0,time.Time{},fmt.Errorf("reminder text is required")}
 	var repeatValue any;if repeat!=""{if repeat!="daily"&&repeat!="weekly"&&repeat!="monthly"{p:=cron.NewParser(cron.Minute|cron.Hour|cron.Dom|cron.Month|cron.Dow);if _,err:=p.Parse(repeat);err!=nil{return 0,time.Time{},fmt.Errorf("invalid recurrence rule: %w",err)}};repeatValue=repeat}
 	res,err:=s.db.ExecContext(ctx,`INSERT INTO reminders(body,due_at,repeat_rule,critical,status,origin_inbox_id) VALUES(?,?,?,?,'scheduled',NULLIF(?,0))`,text,due.UTC().Format(time.RFC3339Nano),repeatValue,boolInt(critical),origin);if err!=nil{return 0,time.Time{},err};id,err:=res.LastInsertId();return id,due,err
@@ -35,6 +51,16 @@ func(s *Service)ListReminders(ctx context.Context)(string,error){
 	rows,err:=s.db.QueryContext(ctx,`SELECT id,body,due_at,critical,repeat_rule FROM reminders WHERE status IN ('scheduled','fired') ORDER BY due_at LIMIT 25`);if err!=nil{return "",err};defer rows.Close();var b strings.Builder;for rows.Next(){var id int64;var body,due string;var critical int;var repeat sql.NullString;if err:=rows.Scan(&id,&body,&due,&critical,&repeat);err!=nil{return "",err};t,_:=time.Parse(time.RFC3339Nano,due);fmt.Fprintf(&b,"%d. %s — %s",id,body,t.In(s.loc).Format("Mon Jan 2 15:04"));if critical!=0{b.WriteString(" [critical]")};if repeat.Valid{fmt.Fprintf(&b," [%s]",repeat.String)};b.WriteByte('\n')};if err:=rows.Err();err!=nil{return "",err};if b.Len()==0{return "No upcoming reminders.",nil};return b.String(),nil
 }
 func(s *Service)ListTasks(ctx context.Context)(string,error){rows,err:=s.db.QueryContext(ctx,`SELECT id,body,due_at FROM tasks WHERE status='open' ORDER BY id DESC LIMIT 25`);if err!=nil{return "",err};defer rows.Close();var b strings.Builder;for rows.Next(){var id int64;var body string;var due sql.NullString;if err:=rows.Scan(&id,&body,&due);err!=nil{return "",err};fmt.Fprintf(&b,"%d. %s",id,body);if due.Valid{fmt.Fprintf(&b," — due %s",due.String)};b.WriteByte('\n')};if err:=rows.Err();err!=nil{return "",err};if b.Len()==0{return "No open tasks.",nil};return b.String(),nil}
+
+// Get returns a reminder's body and due time for callback message edits.
+func(s *Service)Get(ctx context.Context, id int64) (string, time.Time, error) {
+	var body, due string
+	if err := s.db.QueryRowContext(ctx, `SELECT body,due_at FROM reminders WHERE id=?`, id).Scan(&body, &due); err != nil {
+		return "", time.Time{}, err
+	}
+	t, _ := time.Parse(time.RFC3339Nano, due)
+	return body, t, nil
+}
 
 func(s *Service)Done(ctx context.Context,id int64)error{
 	res,err:=s.db.ExecContext(ctx,`UPDATE reminders SET status='acked',acked_at=?,next_attempt_at=NULL WHERE id=? AND status IN ('scheduled','fired')`,time.Now().UTC().Format(time.RFC3339Nano),id);if err!=nil{return err};n,_:=res.RowsAffected();if n>0{return s.scheduleNext(ctx,id)}
@@ -48,9 +74,12 @@ func(s *Service)Run(ctx context.Context){ticker:=time.NewTicker(20*time.Second);
 func(s *Service)fireDue(ctx context.Context){
 	now:=time.Now().UTC();rows,err:=s.db.QueryContext(ctx,`SELECT id,body,due_at,critical,attempts FROM reminders WHERE (status='scheduled' AND due_at<=?) OR (status='fired' AND critical=1 AND attempts<12 AND next_attempt_at<=?) ORDER BY due_at LIMIT 20`,now.Format(time.RFC3339Nano),now.Format(time.RFC3339Nano));if err!=nil{s.log.Error("select reminders failed","error",err);return}
 	type dueReminder struct{id int64;body,due string;critical,attempts int};var due []dueReminder;for rows.Next(){var r dueReminder;if err:=rows.Scan(&r.id,&r.body,&r.due,&r.critical,&r.attempts);err!=nil{s.log.Error("scan reminder failed","error",err);break};due=append(due,r)};rows.Close()
-	for _,r:=range due{parsed,_:=time.Parse(time.RFC3339Nano,r.due);late:=now.Sub(parsed)>time.Minute;label:="Reminder";if late{label="Reminder (late)"};message:=fmt.Sprintf("%s: %s",label,r.body)
-		keyboard:=telegram.InlineKeyboardMarkup{InlineKeyboard:[][]telegram.InlineKeyboardButton{{{Text:"Done",CallbackData:fmt.Sprintf("reminder:done:%d",r.id)},{Text:"Snooze 10 min",CallbackData:fmt.Sprintf("reminder:snooze10:%d",r.id)},{Text:"Snooze 1 h",CallbackData:fmt.Sprintf("reminder:snooze60:%d",r.id)}}}}
-		if s.notifier!=nil{title:="Reminder";priority:="default";if r.critical!=0{title="Critical reminder";priority="urgent"};if err:=s.notifier.Publish(ctx,title,r.body,priority);err!=nil{s.log.Error("ntfy alert failed","reminder_id",r.id,"error",err)}}
+	for _,r:=range due{parsed,_:=time.Parse(time.RFC3339Nano,r.due);late:=now.Sub(parsed)>time.Minute;message:=fmt.Sprintf("⏰ Reminder\n%s\nDue %s",r.body,parsed.In(s.loc).Format("Mon Jan 2 15:04"));if late{message+=" (late)"};if r.critical!=0{message+="\n🚨 Critical alarm — repeating every 5 min until you tap Done"}
+		keyboard:=telegram.InlineKeyboardMarkup{InlineKeyboard:[][]telegram.InlineKeyboardButton{
+			{{Text:"✅ Done",CallbackData:fmt.Sprintf("reminder:done:%d",r.id)},{Text:"⏰ Snooze 10 min",CallbackData:fmt.Sprintf("reminder:snooze10:%d",r.id)}},
+			{{Text:"⏰ Snooze 1 h",CallbackData:fmt.Sprintf("reminder:snooze60:%d",r.id)},{Text:"⏰ Tomorrow",CallbackData:fmt.Sprintf("reminder:snoozeDay:%d",r.id)}},
+		}}
+		if s.notifier!=nil{title:="Reminder";priority:="default";if r.critical!=0{title="Critical reminder";priority="5"};if err:=s.notifier.Publish(ctx,title,r.body,priority);err!=nil{s.log.Error("ntfy alert failed","reminder_id",r.id,"error",err)}}
 		if err:=s.api.SendMessageWithKeyboard(ctx,s.chatID(ctx),message,keyboard);err!=nil{s.log.Error("send reminder failed","reminder_id",r.id,"error",err);continue}
 		if r.critical!=0{_,err=s.db.ExecContext(ctx,`UPDATE reminders SET status='fired',attempts=attempts+1,next_attempt_at=? WHERE id=?`,now.Add(5*time.Minute).Format(time.RFC3339Nano),r.id)}else{_,err=s.db.ExecContext(ctx,`UPDATE reminders SET status='fired' WHERE id=?`,r.id)};if err!=nil{s.log.Error("update fired reminder failed","reminder_id",r.id,"error",err)}
 	}
