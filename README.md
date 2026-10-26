@@ -1,6 +1,6 @@
 # Second Brain Bot
 
-A self-hosted single-user Telegram assistant built in Go. It stores notes, reminders and tasks; schedules recurring research reports, messages, and stored-file sends; keeps encrypted files locally or in R2; indexes PDF/image text locally with SQLite FTS5; transcribes optional voice notes; and can use an OpenAI-compatible chat endpoint and Firecrawl web search.
+A self-hosted single-user Telegram assistant built in Go. It stores notes, reminders and tasks in a SQLite database on the VM (not Cloudflare R2); schedules recurring research reports, messages, and stored-file sends; keeps encrypted files in local age-encrypted storage on the VM (Cloudflare R2 is an optional alternative backend, not the deployed default); indexes PDF/image text locally with SQLite FTS5; transcribes optional voice notes; and can use an OpenAI-compatible chat endpoint and Firecrawl web search.
 
 Create scheduled tasks in natural language (for example, “Every day at 7am, send me an AI news report” or “Send file #8 tomorrow at 7pm with a note to fill it out”). Use `/schedules` to list them, then ask the assistant to cancel a schedule by its ID. Reports use the configured LLM and Firecrawl daily limits.
 

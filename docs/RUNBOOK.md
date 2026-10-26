@@ -1,6 +1,6 @@
 # Restore a Second Brain database
 
-The encrypted backup object is stored in the private R2 bucket under `backups/`. The age identity at `/etc/secondbrain/age.key` is required to decrypt it. Keep an offline copy of that identity; without it, the database backup cannot be read.
+The database is SQLite at `/var/lib/secondbrain/data/secondbrain.db` — it is not Cloudflare R2. The encrypted backup is stored by the active storage backend under `backups/`. On the deployed VM (`FILE_STORAGE_BACKEND=local`) that is `/var/lib/secondbrain/data/objects/backups/<object>.db.age`. Only if the backend is `r2` is the backup in the private R2 bucket under `backups/`. The age identity at `/etc/secondbrain/age.key` is required to decrypt it. Keep an offline copy of that identity; without it, the database backup cannot be read.
 
 1. SSH to the VM and stop the bot: `sudo systemctl stop secondbrain`.
 2. Confirm the bot is stopped: `sudo systemctl is-active secondbrain` should print `inactive`.
@@ -15,4 +15,4 @@ The encrypted backup object is stored in the private R2 bucket under `backups/`.
 
 For a scratch restore, choose a new destination path outside the live data directory and run the same `--restore` command. Open it with `sqlite3 <path> 'PRAGMA integrity_check;'` and search the FTS tables. Do not point the running service at a scratch database.
 
-The program can restore an existing backup object, but it does not yet provide a command to list R2 backups. Record the key printed by `/backup` or inspect the private bucket in the Cloudflare dashboard.
+The program can restore an existing backup object, but it does not yet provide a command to list backups. Record the key printed by `/backup`, query the `backups` table in SQLite, or — for the local backend — list `/var/lib/secondbrain/data/objects/backups/`. Only for the R2 backend, inspect the private bucket in the Cloudflare dashboard.

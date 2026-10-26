@@ -28,7 +28,7 @@ Apply database schema changes through the built-in numbered migration runner. Ta
 2. Restore `/etc/secondbrain/env` from your secure password manager. Do not reuse a VM image that contains a compromised age key or API token.
 3. Restore `/etc/secondbrain/age.key` from its offline backup and set ownership to `secondbrain:secondbrain`, mode `0600`. Verify its public recipient matches `AGE_RECIPIENT`.
 4. Install the systemd units from `deploy/systemd`, reload systemd, and enable the backup timer. Start the service and check logs.
-5. Restore the latest encrypted SQLite backup following `docs/RUNBOOK.md`; then send `/find` and retrieve one known file to verify database search and age/R2 access.
+5. Restore the latest encrypted SQLite backup following `docs/RUNBOOK.md`; then send `/find` and retrieve one known file to verify database search and age-decrypted access to the active storage backend (local objects on the VM, or R2 only if that backend is configured).
 6. Rotate credentials that may have been exposed by the lost VM. If it was compromised, rotate all provider keys and invalidate the old VM before restoring.
 
 ## Monitoring and logs
@@ -37,4 +37,4 @@ Logs go to journald. Inspect with `journalctl -u secondbrain`; journald handles 
 
 ## Backup schedule
 
-`secondbrain-backup.timer` runs daily near 02:15 local system time. It creates a SQLite `VACUUM INTO` snapshot, encrypts it with age, uploads under `backups/`, and deletes recorded backups older than 14 days. `/backup` runs the same operation immediately. Verify timer state with `systemctl list-timers secondbrain-backup.timer` and inspect `journalctl -u secondbrain-backup`.
+`secondbrain-backup.timer` runs daily near 02:15 local system time. It creates a SQLite `VACUUM INTO` snapshot, encrypts it with age, saves it under `backups/` in the active storage backend (local backend: `/var/lib/secondbrain/data/objects/backups/`; R2 backend only: the bucket's `backups/` prefix), and deletes recorded backups older than 14 days. `/backup` runs the same operation immediately. Verify timer state with `systemctl list-timers secondbrain-backup.timer` and inspect `journalctl -u secondbrain-backup`.

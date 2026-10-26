@@ -13,19 +13,19 @@ The acceptance checklist is designed for the real VM and Telegram account. It ca
 | 7 | Reminder due now | Telegram message with Done/Snooze | Not run: live bot required | |
 | 8 | Reboot with pending reminder | Fires late after reboot | Not run: VM access required | |
 | 9 | Ignore critical reminder | ntfy repeats every 5 minutes; Done stops it | Not run: ntfy host, phone, and live bot required | |
-| 10 | Upload 150 MB video as File | Saved without timeout; memory remains safe | Not run: local Telegram Bot API and R2 required | |
-| 11 | Text PDF | Search returns matching word and page | Not run: R2 and OCR packages required | |
+| 10 | Upload 150 MB video as File | Saved without timeout; memory remains safe | Not run: local Telegram Bot API and active file storage (local on the VM) required | |
+| 11 | Text PDF | Search returns matching word and page | Not run: active file storage and OCR packages required | |
 | 12 | Scanned PDF | OCR result searchable | Not run: VM and sample document required | |
 | 13 | PDF screenshot | Embedded image word searchable | Not run: VM and sample document required | |
 | 14 | Search with one-letter typo | Trigram fallback finds intended result | Not run: runtime test required | |
 | 15 | Voice search phrase | Local search; no LLM call | Not run: live bot required | |
-| 16 | Send file button | Retrieved bytes match original SHA-256 | Not run: R2 and Telegram required | |
-| 17 | Inspect R2 object | Stored bytes are age ciphertext | Not run: R2 credentials required | |
-| 18 | Upload duplicate | Existing file ID reported | Not run: R2 and Telegram required | |
+| 16 | Send file button | Retrieved bytes match original SHA-256 | Not run: active file storage and Telegram required | |
+| 17 | Inspect stored object (local objects directory, or R2 bucket if that backend is configured) | Stored bytes are age ciphertext | Not run: access to the active storage backend required | |
+| 18 | Upload duplicate | Existing file ID reported | Not run: active file storage and Telegram required | |
 | 19 | Kill service during indexing | Resumes from last page | Not run: VM and sample PDF required | |
 | 20 | Ask for latest news/topic | Firecrawl-backed answer with sources | Not run: LLM and Firecrawl keys required | |
 | 21 | Exceed daily LLM budget | Message saved as note with notice | Not run: configured LLM and live bot required | |
-| 22 | Backup and scratch restore | Restored DB integrity/search pass | Not run: live R2 credentials and scratch database required | |
+| 22 | Backup and scratch restore | Restored DB integrity/search pass | Not run: live active storage backend and scratch database required | |
 | 23 | Peak RAM on large scan | Within configured memory limits, no OOM | Not run: target VM and sample scan required | |
 | 24 | Create one-off scheduled message in natural language | It appears in `/schedules` and arrives at the requested time | Not run: user-visible Telegram check required | |
 | 25 | Create recurring scheduled report | Report arrives with source URLs; LLM/Firecrawl counters remain within configured limits | Not run: live LLM, Firecrawl, and Telegram check required | |

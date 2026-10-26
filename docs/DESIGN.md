@@ -1,5 +1,7 @@
 # Second Brain Bot — Design & Build Guide
 
+> **Correction — 2026-10-26: The database is SQLite, not Cloudflare R2.** R2 was never the database; it was only a possible file-object store. On the deployed VM the active file storage is local: `FILE_STORAGE_BACKEND=local`, age-encrypted objects under `/var/lib/secondbrain/data/objects/`, and the SQLite database at `/var/lib/secondbrain/data/secondbrain.db`. R2 is an optional alternative backend (`FILE_STORAGE_BACKEND=r2`) only. `docs/DEPLOYMENT.md` and `docs/VM.md` already said this; this older design document is now corrected to match the code in `internal/storage/` and `internal/config/`.
+
 A private, self-hosted personal assistant you talk to on Telegram. You send it text, voice notes, photos, videos and PDFs. It keeps notes, runs reminders and tasks, stores your files, and finds them again by searching the text inside them. It runs on a small Ubuntu VM (2 vCPU, 1 GB RAM, 30 GB disk).
 
 How to use this document:
@@ -40,7 +42,7 @@ How to use this document:
 |---|---|
 | Interface | Telegram bot |
 | Host | Ubuntu VM, 2 vCPU, 1 GB RAM, 30 GB disk |
-| File storage | Cloudflare R2 (photos, videos, PDFs up to about 200 MB) |
+| File storage | Local age-encrypted storage on the VM (photos, videos, PDFs up to about 200 MB); Cloudflare R2 is an optional alternative backend, not the default |
 | Voice input | Yes, voice notes are first-class input |
 | File search | Keyword full-text search over locally OCR'd text. No embeddings, no LLM reading documents |
 | Critical alerts | Self-hosted ntfy |
@@ -54,7 +56,7 @@ How to use this document:
 | Transcription | Groq Whisper large-v3 | Free tier, no card, OpenAI-compatible |
 | LLM for chat intent | Any OpenAI-compatible endpoint, configured by env vars | Provider is still open (see Section 17) |
 | Search commands | `/find ...` and messages starting with "search" or "find" are handled **locally, without any LLM** | Keeps search phrases private and free |
-| File encryption | Encrypt every file on the VM with `age` before it goes to R2 | Cloudflare then only stores ciphertext |
+| File encryption | Encrypt every file on the VM with `age` before it is stored | If R2 is the configured backend, Cloudflare then only stores ciphertext |
 | Timezone | `Asia/Kolkata` (configurable) | Reminders must resolve "tomorrow at 6" correctly |
 | Exposing ntfy | Cloudflare Tunnel, no open inbound ports | Easy TLS, nothing to port-forward |
 | SQLite driver | `modernc.org/sqlite` (pure Go) | No cgo, easy cross-compiling |
@@ -81,8 +83,8 @@ telegram-bot-api (local mode, 127.0.0.1:8081)         |
 +--+------------+---------------+-----------------+--------------+-----+
    |            |               |                 |              |
    v            v               v                 v              v
- Groq         LLM API       Cloudflare R2     Firecrawl        ntfy (self-hosted)
- (voice)      (intent)      (encrypted files) (web search)     via Cloudflare Tunnel
+ Groq         LLM API       Local encrypted   Firecrawl        ntfy (self-hosted)
+ (voice)      (intent)      storage (R2 opt.) (web search)     via Cloudflare Tunnel
                                                                    |
                                                                    v
                                                              your phone alarm
@@ -150,8 +152,8 @@ Every incoming update goes through the same steps, in order:
 ### 4.7 File storage
 - You send files as **File/Document** to keep originals (Telegram compresses photos and videos sent normally).
 - A **local Telegram Bot API server** lifts the 20 MB download limit so files up to about 200 MB work.
-- Pipeline: hash, dedupe, encrypt with `age` while streaming, multipart upload to R2, row in `files` table.
-- R2 free tier is about 10 GB at the time of writing. Check Cloudflare's current limits and whether it requires a payment method on file.
+- Pipeline: hash, dedupe, encrypt with `age` while streaming, save to the active storage backend (local file under `/var/lib/secondbrain/data/objects/` on the deployed VM; multipart upload to R2 only when `FILE_STORAGE_BACKEND=r2`), row in `files` table.
+- Local storage uses VM disk, so watch disk usage (see section 7.3). The R2 free tier was about 10 GB at the time of writing; that only matters if you switch to the R2 backend. Check Cloudflare's current limits and whether it requires a payment method on file.
 
 ### 4.8 Indexing (OCR) in the background
 - One job at a time. Page by page. Checkpointed, so a crash resumes.
@@ -171,7 +173,7 @@ Every incoming update goes through the same steps, in order:
 - Free. VM load: light.
 
 ### 4.10 File retrieval
-- Tap **Send file**: the bot streams the object from R2, decrypts it, and sends it with `sendDocument`, `sendPhoto` or `sendVideo`.
+- Tap **Send file**: the bot streams the object from the active storage backend (local objects directory on the deployed VM, or R2 if that backend is configured), decrypts it, and sends it with `sendDocument`, `sendPhoto` or `sendVideo`.
 - Presigned links are not used because the files are encrypted.
 
 ### 4.11 Web search (Firecrawl)
@@ -180,7 +182,7 @@ Every incoming update goes through the same steps, in order:
 
 ### 4.12 Operations
 - `/status`: RAM, swap, disk %, job queue length, last errors, LLM tokens today, upcoming reminders.
-- Nightly encrypted backup of the SQLite database to R2.
+- Nightly encrypted backup of the SQLite database to the active storage backend under `backups/` (on the deployed VM: `/var/lib/secondbrain/data/objects/backups/`).
 - ntfy warning when disk is above 80% or jobs keep failing.
 
 ---
@@ -193,7 +195,7 @@ Every incoming update goes through the same steps, in order:
 | Voice audio | Groq | For transcription |
 | Short chat text (reminders, tasks, general messages) | LLM provider | Never file contents, never search results |
 | Search phrases starting with "search"/"find" | Nobody | Handled locally |
-| Files | Cloudflare R2 | Encrypted with `age` first, so Cloudflare sees ciphertext only |
+| Files | Active storage backend: local VM disk on the deployed VM (R2 only if `FILE_STORAGE_BACKEND=r2`) | Encrypted with `age` first, so any external store sees ciphertext only |
 | OCR text and search index | Stays on the VM | Also in the encrypted DB backups |
 | Web search queries | Firecrawl | Only when you ask for a web lookup |
 
@@ -207,7 +209,7 @@ Every incoming update goes through the same steps, in order:
 | Telegram library | `github.com/go-telegram/bot` (or `telego`). Agent must verify it supports a custom API server URL and file uploads |
 | Database | SQLite with FTS5 via `modernc.org/sqlite` |
 | Recurrence | `github.com/robfig/cron/v3` parser for cron-style repeats |
-| R2 / S3 | `github.com/aws/aws-sdk-go-v2` with the S3 uploader (multipart) |
+| R2 / S3 (optional backend only) | `github.com/aws/aws-sdk-go-v2` with the S3 uploader (multipart) |
 | Encryption | `filippo.io/age` streaming encrypt and decrypt |
 | Unicode | `golang.org/x/text/unicode/norm` |
 | HTTP clients | Standard library for Groq, LLM and Firecrawl (all plain JSON/HTTP) |
@@ -273,7 +275,7 @@ It fits, tightly. Rules that keep it safe:
 - Subtract anything else already running on the VM.
 
 ### 7.3 Disk budget
-Text, FTS indexes and metadata for thousands of documents take well under 1 GB. Files live in R2, not on the VM. Watch the temp directory and the Telegram local API server's cache (it keeps downloaded files until you delete them, so the bot must clean up after each file).
+Text, FTS indexes and metadata for thousands of documents take well under 1 GB. With the local backend active on the deployed VM, files live on the VM disk under `/var/lib/secondbrain/data/objects/`, not in R2. Watch disk usage, the temp directory and the Telegram local API server's cache (it keeps downloaded files until you delete them, so the bot must clean up after each file).
 
 ---
 
@@ -313,7 +315,7 @@ CREATE TABLE files (
   id INTEGER PRIMARY KEY, created_at TEXT NOT NULL,
   name TEXT NOT NULL, mime TEXT, size INTEGER,
   sha256 TEXT UNIQUE,                   -- of plaintext, for dedupe
-  r2_key TEXT NOT NULL,                 -- random id, not the hash
+  r2_key TEXT NOT NULL,                 -- random storage object key, not the hash; the column name is historical, the key is used by both the local and R2 backends
   encrypted INTEGER DEFAULT 1,
   caption TEXT DEFAULT '', tags TEXT DEFAULT '',
   index_status TEXT DEFAULT 'pending',  -- pending|running|done|failed|skipped
@@ -366,7 +368,7 @@ Text normalization before indexing and before querying: Unicode NFC, lowercase, 
 - Telegram local API server and the bot bind to `127.0.0.1` only.
 - ntfy is set to `auth-default-access: deny-all`, with a token for the bot and your user for the phone.
 - Do not log message contents at info level. Log metadata only.
-- Back up your **age key** separately and offline (password manager). If you lose it, every encrypted file in R2 is unrecoverable. If the VM is compromised, the key on it is exposed, so keep the VM patched (`unattended-upgrades`).
+- Back up your **age key** separately and offline (password manager). If you lose it, every encrypted file in the active storage backend is unrecoverable. If the VM is compromised, the key on it is exposed, so keep the VM patched (`unattended-upgrades`).
 
 ---
 
@@ -376,7 +378,7 @@ Text normalization before indexing and before querying: Unicode NFC, lowercase, 
 
 1. You send a PDF as a File. The local Bot API server receives it and, in local mode, the file is already on the VM's disk.
 2. Bot checks your user ID, logs to `inbox`, streams the file to compute SHA-256, checks for a duplicate.
-3. Streams it through `age` encryption into an R2 multipart upload (key is a random ID). Inserts a `files` row.
+3. Streams it through `age` encryption into the active storage backend (local: a file under the objects directory; R2 only if that backend is configured: a multipart upload). The key is a random ID. Inserts a `files` row.
 4. Replies immediately: "Saved lease.pdf (40 MB). Indexing in background." You can keep using the bot.
 5. Inserts an `index_file` job. A single worker picks it up.
 6. For each page: `pdftotext`. If the page text is under about 30 characters, rasterize and OCR. If the page contains sizable images and `OCR_IMAGE_PAGES=true`, OCR it too and merge. Write `file_pages`, update both FTS tables, checkpoint progress.
@@ -391,7 +393,7 @@ Text normalization before indexing and before querying: Unicode NFC, lowercase, 
 3. Trigger regex matches, filler words are dropped (`file which has and the ...`), keywords become `document deposit`.
 4. Query runs AND, then OR, then trigram fallback. The bot says which mode it used.
 5. Results list: file name, page, highlighted snippet, [Send file].
-6. Tap Send file. The bot downloads from R2, decrypts, sends it, deletes the temp copy.
+6. Tap Send file. The bot downloads from the active storage backend, decrypts, sends it, deletes the temp copy.
 
 ### 10.3 What happens with a critical reminder
 
@@ -425,12 +427,15 @@ GROQ_API_KEY=
 STT_MODEL=whisper-large-v3
 STT_LANGUAGE=auto                # en | hi | mr | auto
 
-# Storage (Cloudflare R2, S3 API)
-R2_ACCOUNT_ID=
-R2_ACCESS_KEY_ID=
-R2_SECRET_ACCESS_KEY=
-R2_BUCKET=
-R2_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+# Storage: local is active on the deployed VM; R2 is an optional alternative backend
+FILE_STORAGE_BACKEND=local
+LOCAL_STORAGE_DIR=/var/lib/secondbrain/data/objects
+# Only when FILE_STORAGE_BACKEND=r2 (Cloudflare R2, S3 API):
+# R2_ACCOUNT_ID=
+# R2_ACCESS_KEY_ID=
+# R2_SECRET_ACCESS_KEY=
+# R2_BUCKET=
+# R2_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
 AGE_RECIPIENT=                   # public key
 AGE_IDENTITY_FILE=/etc/secondbrain/age.key
 
@@ -480,7 +485,7 @@ Hard rules:
 5. Only my Telegram user ID gets responses.
 6. Secrets only in environment variables loaded from /etc/secondbrain/env.
    Never hardcode, never commit, never print them in logs.
-7. Do not invent API details. When you use Telegram, Groq, Cloudflare R2, ntfy,
+7. Do not invent API details. When you use Telegram, Groq, local storage or optional Cloudflare R2, ntfy,
    Firecrawl, age or any library, check the current official documentation first
    and tell me which page you used.
 8. Work one phase at a time. At the end of each phase: run the tests, show me
@@ -594,7 +599,7 @@ and a clear message to me. Check Groq's current docs for the endpoint, limits
 and supported formats and tell me what you found.
 ```
 
-### Phase 6 — Local Bot API server, file receive, encryption, R2
+### Phase 6 — Local Bot API server, file receive, encryption, storage (local active, R2 optional)
 
 ```text
 Phase 6. Implement file storage:
@@ -605,13 +610,14 @@ Phase 6. Implement file storage:
 2. Handle document, photo and video messages. Stream, never buffer whole files.
 3. Compute SHA-256 and dedupe against files.sha256.
 4. Encrypt with age (recipient public key from AGE_RECIPIENT) in a streaming
-   pipe into an R2 multipart upload (aws-sdk-go-v2). R2 key is a random ID.
+   pipe into the active storage backend (local file write; R2 multipart upload
+   with aws-sdk-go-v2 only when FILE_STORAGE_BACKEND=r2). The storage key is a random ID.
 5. Insert the files row, reply "Saved ... Indexing in background", enqueue an
    index_file job, delete temp files and the Bot API server's cached copy.
 6. Caption text becomes caption and tags. A voice note within 90 seconds of a
    file attaches its transcript to that file.
 7. Add a round-trip test: encrypt -> upload -> download -> decrypt -> compare hash.
-Also add an R2 lifecycle rule suggestion to abort incomplete multipart uploads.
+If the R2 backend is used, also add an R2 lifecycle rule suggestion to abort incomplete multipart uploads.
 ```
 
 ### Phase 7 — Indexing worker (OCR)
@@ -642,10 +648,10 @@ peak memory on the VM.
 Phase 8. Extend /find and the voice/text "search ..." trigger to cover file
 pages. Results show file name, page number, highlighted snippet and a
 [Send file] button. Add filters (type:pdf|photo|video, after:, before:, tag:).
-Implement Send file: stream from R2, decrypt, send with the right Telegram
+Implement Send file: stream from the active storage backend, decrypt, send with the right Telegram
 method (sendDocument/sendPhoto/sendVideo; use the local server for big
 uploads), then delete the temp copy. Add /files (recent list), /tag <id> <tags>
-and /delete <id> (with confirmation, removes R2 object, rows and index).
+and /delete <id> (with confirmation, removes the storage object, rows and index).
 Everything stays local; nothing goes to an LLM.
 ```
 
@@ -677,7 +683,7 @@ confirm with a button. Add timeouts, error handling and a daily call cap.
 
 ```text
 Phase 11. Add: nightly SQLite backup (use the SQLite backup mechanism, not a
-file copy), encrypt with age and upload to R2 under backups/ with 14-day
+file copy), encrypt with age and save to the active storage backend under backups/ with 14-day
 retention, via a systemd timer; a /backup command; disk and failed-job alerts
 sent through ntfy at normal priority; log rotation; final systemd hardening;
 a restore procedure written as a numbered runbook in docs/RUNBOOK.md, tested
@@ -747,7 +753,7 @@ LLM_BASE_URL, LLM_API_KEY and LLM_MODEL. Include a curl test that exercises
 tool calling.
 ```
 
-### A5 — Cloudflare R2 bucket and keys
+### A5 — Cloudflare R2 bucket and keys (optional backend only — skip this if you use local storage)
 
 ```text
 Explain step by step how to enable Cloudflare R2, create a private bucket,
@@ -842,7 +848,7 @@ files get cleaned up. Verify details in the project's current README.
 | 14 | Search with a one-letter typo | Trigram fallback still finds it |
 | 15 | Say "search file which has document and deposit" | Local search, correct files, no LLM call in logs |
 | 16 | Tap Send file | File arrives identical (verify hash) |
-| 17 | Look at the R2 bucket | Objects are unreadable ciphertext |
+| 17 | Look at the active storage (local objects directory on the VM, or the R2 bucket if that backend is configured) | Objects are unreadable ciphertext |
 | 18 | Upload the same file twice | Deduplicated |
 | 19 | Kill the service mid-indexing | Resumes from the last page after restart |
 | 20 | Ask "what's the latest on <topic>" | Web search answer via Firecrawl |
@@ -858,8 +864,8 @@ files get cleaned up. Verify details in the project's current README.
 - Photos without text (a beach, a whiteboard sketch) are searchable only by your caption, tags and date.
 - Tesseract is weaker on handwriting, blurry photos and complex tables. Printed text scans work well. Preprocessing matters more than any search trick.
 - OCR on a 300-page scan can take a long time on 2 vCPUs. It runs in the background and reports progress.
-- Free tiers (Groq, Firecrawl, LLM providers, R2) change. Re-check limits and data-use terms before relying on them.
-- Telegram sees everything you send the bot. Encryption protects files at R2, not inside Telegram.
+- Free tiers (Groq, Firecrawl, LLM providers, R2 if used) change. Re-check limits and data-use terms before relying on them.
+- Telegram sees everything you send the bot. Encryption protects files at rest in the storage backend, not inside Telegram.
 - Losing the age key means losing access to all stored files.
 - Voice transcription of mixed-language speech needs testing on your own voice.
 
